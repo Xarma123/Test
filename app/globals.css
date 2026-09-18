@@ -1,0 +1,68 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+:root { --bg:#090b0d; --panel:#111417; --panel-2:#171b1f; --line:#252b30; --muted:#8b969d; --text:#f3f5f4; --lime:#c7f36b; --orange:#ff9d5c; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font-family:'Manrope',sans-serif; }
+button,input,textarea { font:inherit; }
+button { cursor:pointer; }
+.mono { font-family:'DM Mono',monospace; }
+.shell { min-height:100vh; max-width:1180px; margin:0 auto; padding:24px 28px 40px; }
+.topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:32px; }
+.brand { display:flex; align-items:center; gap:11px; font-weight:800; letter-spacing:-.03em; font-size:17px; }
+.brand-mark { display:grid; place-items:center; width:32px; height:32px; border-radius:9px; background:var(--lime); color:#101410; }
+.avatar { display:grid; place-items:center; width:36px; height:36px; border:1px solid var(--line); border-radius:50%; background:#20262a; color:#dfe6e0; font-size:12px; font-weight:800; }
+.eyebrow { color:var(--lime); text-transform:uppercase; font-size:11px; letter-spacing:.15em; font-weight:800; }
+h1 { font-size:clamp(30px,5vw,48px); line-height:1.05; letter-spacing:-.06em; margin:9px 0 12px; }
+.subtle { color:var(--muted); font-size:14px; line-height:1.6; }
+.hero { display:flex; justify-content:space-between; align-items:flex-end; gap:20px; margin-bottom:28px; }
+.hero-stats { display:flex; gap:8px; flex-wrap:wrap; }
+.stat-pill { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px; min-width:110px; }
+.stat-pill small { display:block; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.1em; margin-bottom:5px; }
+.stat-pill strong { font-size:17px; }
+.grid { display:grid; grid-template-columns:1.08fr .92fr; gap:16px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:20px; }
+.card.wide { grid-column:1/-1; }
+.card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:19px; }
+.card-title { font-size:17px; font-weight:800; letter-spacing:-.03em; }
+.card-kicker { color:var(--muted); font-size:12px; margin-top:4px; }
+label { color:var(--muted); font-size:11px; display:block; margin-bottom:7px; }
+.input { width:100%; background:#0c0f11; border:1px solid var(--line); color:var(--text); border-radius:10px; padding:11px 12px; outline:none; }
+.input:focus { border-color:var(--lime); }
+.fields { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
+.fields.four { grid-template-columns:repeat(4,1fr); }
+.btn { border:0; border-radius:10px; padding:11px 14px; font-weight:800; font-size:12px; display:inline-flex; align-items:center; justify-content:center; gap:8px; transition:transform .15s, filter .15s; }
+.btn:hover { filter:brightness(1.08); transform:translateY(-1px); }
+.btn.primary { background:var(--lime); color:#12170f; }
+.btn.secondary { background:var(--panel-2); border:1px solid var(--line); color:var(--text); }
+.btn.full { width:100%; margin-top:14px; }
+.upload { border:1px dashed #3a464d; border-radius:12px; padding:16px; display:flex; align-items:center; gap:12px; color:var(--muted); background:#0c0f11; margin-bottom:14px; }
+.upload strong { color:var(--text); display:block; font-size:13px; margin-bottom:3px; }
+.icon-box { width:35px; height:35px; display:grid; place-items:center; border-radius:9px; background:#20282d; color:var(--lime); flex:0 0 auto; }
+.or { text-align:center; color:#667177; font-size:11px; margin:10px 0; }
+.score { display:flex; align-items:center; gap:16px; background:#1a2118; border:1px solid #354228; border-radius:14px; padding:14px; margin-top:15px; }
+.score-num { font-size:38px; font-weight:800; letter-spacing:-.08em; color:var(--lime); }
+.score p { margin:3px 0 0; color:#b8c1b5; font-size:12px; line-height:1.5; }
+.list { display:flex; flex-direction:column; gap:9px; }
+.exercise { display:grid; grid-template-columns:1fr 62px 62px 75px 26px; gap:8px; align-items:center; }
+.exercise + .exercise { margin-top:8px; }
+.exercise .input { padding:9px 8px; font-size:12px; }
+.remove { border:0; background:transparent; color:#68757b; }
+.remove:hover { color:var(--orange); }
+.add-row { margin-top:12px; color:var(--lime); background:transparent; border:0; padding:4px 0; font-size:12px; font-weight:800; }
+.history-item { display:grid; grid-template-columns:1fr repeat(4,auto); align-items:center; gap:22px; border-top:1px solid var(--line); padding:14px 0; }
+.history-item:first-child { border-top:0; padding-top:0; }
+.history-date { font-weight:800; font-size:13px; }
+.history-value { text-align:right; font-size:13px; }
+.history-value small { display:block; color:var(--muted); font-size:10px; margin-bottom:4px; }
+.badge { padding:5px 8px; border-radius:7px; background:#223020; color:var(--lime); font-size:11px; font-weight:800; }
+.tabs { display:flex; gap:4px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:4px; margin-bottom:18px; }
+.tab { flex:1; border:0; border-radius:8px; background:transparent; color:var(--muted); padding:9px; font-size:12px; font-weight:800; }
+.tab.active { color:var(--text); background:var(--panel-2); }
+.chat { display:flex; flex-direction:column; gap:12px; }
+.bubble { max-width:82%; border-radius:14px; padding:12px 14px; font-size:13px; line-height:1.55; }
+.bubble.ai { background:var(--panel-2); color:#dbe3df; align-self:flex-start; border-bottom-left-radius:4px; }
+.bubble.me { background:#29361d; color:#e7f5cf; align-self:flex-end; border-bottom-right-radius:4px; }
+.chat-input { display:flex; gap:8px; margin-top:3px; }
+.chat-input .input { flex:1; }
+@media (max-width:760px) { .shell { padding:18px 15px 32px; } .topbar { margin-bottom:25px; } .hero { display:block; } .hero-stats { margin-top:20px; } .grid { grid-template-columns:1fr; } .card.wide { grid-column:auto; } .fields.four { grid-template-columns:repeat(2,1fr); } .history-item { grid-template-columns:1fr 1fr 1fr; gap:11px; } .history-value:nth-last-child(-n+2) { text-align:left; } .history-date { grid-column:1/-1; } .exercise { grid-template-columns:1fr 50px 50px 65px 22px; } }
