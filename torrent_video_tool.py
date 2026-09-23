@@ -142,18 +142,22 @@ def bencode(obj: Any) -> bytes:
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".ogv"}
 
 
+import concurrent.futures
+
 @dataclass
 class MagnetInfo:
     info_hash: bytes
     display_name: str
     trackers: List[str]
     explicit_peers: List[Tuple[str, int]]
+    web_seeds: List[str]
+    exact_sources: List[str]
     raw_uri: str
 
 
 def parse_magnet_uri(uri: str) -> MagnetInfo:
     """
-    Parse a `magnet:?xt=urn:btih:<hash>&dn=...&tr=...&x.pe=host:port` link.
+    Parse a `magnet:?xt=urn:btih:<hash>&dn=...&tr=...&ws=...&x.pe=host:port` link.
     Supports both 40-char hex SHA-1 info hashes and 32-char Base32 info hashes.
     """
     uri = uri.strip()
@@ -180,6 +184,8 @@ def parse_magnet_uri(uri: str) -> MagnetInfo:
 
     display_name = qs.get("dn", ["magnet_video.mp4"])[0]
     trackers = list(dict.fromkeys(qs.get("tr", [])))
+    web_seeds = list(dict.fromkeys(qs.get("ws", [])))
+    exact_sources = list(dict.fromkeys(qs.get("xs", []) + qs.get("as", [])))
 
     explicit_peers: List[Tuple[str, int]] = []
     for pe in qs.get("x.pe", []) + qs.get("peer", []):
@@ -192,6 +198,8 @@ def parse_magnet_uri(uri: str) -> MagnetInfo:
         display_name=display_name,
         trackers=trackers,
         explicit_peers=explicit_peers,
+        web_seeds=web_seeds,
+        exact_sources=exact_sources,
         raw_uri=uri,
     )
 
@@ -661,21 +669,32 @@ def discover_peers_from_trackers(
     info_hash: bytes,
     peer_id: bytes,
     left: int = 1048576,
+    timeout: float = 2.5,
 ) -> List[Tuple[str, int]]:
-    discovered: List[Tuple[str, int]] = []
-    for tr in trackers:
+    """Query all HTTP and UDP trackers concurrently so a single slow tracker never blocks discovery."""
+    if not trackers:
+        return []
+
+    def _query_one(tr: str) -> List[Tuple[str, int]]:
         try:
             if tr.startswith(("http://", "https://")):
-                peers = query_http_tracker(tr, info_hash, peer_id, 6881, left)
+                return query_http_tracker(tr, info_hash, peer_id, 6881, left, timeout=timeout)
             elif tr.startswith("udp://"):
-                peers = query_udp_tracker(tr, info_hash, peer_id, 6881, left)
-            else:
-                peers = []
-            for p in peers:
-                if p not in discovered:
-                    discovered.append(p)
+                return query_udp_tracker(tr, info_hash, peer_id, 6881, left, timeout=timeout)
         except Exception:
-            continue
+            pass
+        return []
+
+    discovered: List[Tuple[str, int]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(trackers))) as ex:
+        futures = [ex.submit(_query_one, tr) for tr in trackers]
+        for fut in concurrent.futures.as_completed(futures, timeout=timeout + 0.8):
+            try:
+                for p in fut.result():
+                    if p not in discovered:
+                        discovered.append(p)
+            except Exception:
+                continue
     return discovered
 
 
@@ -1164,6 +1183,109 @@ def query_dht_for_peers(info_hash: bytes, timeout: float = 3.5) -> List[Tuple[st
     return peers
 
 
+ONLINE_MAGNET_PRESETS: Dict[str, str] = {
+    "sintel": (
+        "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10"
+        "&dn=Sintel"
+        "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+        "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
+        "&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F"
+    ),
+    "big_buck_bunny": (
+        "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
+        "&dn=Big+Buck+Bunny"
+        "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+        "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
+        "&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F"
+    ),
+    "tears_of_steel": (
+        "magnet:?xt=urn:btih:209c8226b299b308beaf2b9cd3fb49212dbd13ec"
+        "&dn=Tears+of+Steel"
+        "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+        "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
+        "&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F"
+    ),
+}
+
+
+class WebSeedWorker(threading.Thread):
+    """
+    BEP 0019 HTTP/HTTPS WebSeed Worker (`ws=` in magnet links / `url-list` in torrents).
+    Downloads pieces via HTTP `Range` requests across single- or multi-file layouts
+    and verifies every piece's 20-byte SHA-1 hash before storing in `SparseVideoPieceStore`.
+    """
+
+    def __init__(
+        self,
+        ws_base_url: str,
+        metadata: TorrentMetadata,
+        store: SparseVideoPieceStore,
+        stop_event: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.ws_base_url = ws_base_url
+        self.metadata = metadata
+        self.store = store
+        self.stop_event = stop_event
+
+    def _file_url(self, file_entry: TorrentFileEntry) -> str:
+        quoted_path = "/".join(urllib.parse.quote(part) for part in file_entry.path.split("/"))
+        if self.ws_base_url.endswith("/"):
+            return self.ws_base_url + quoted_path
+        if len(self.metadata.files) == 1:
+            return self.ws_base_url
+        return self.ws_base_url + "/" + quoted_path
+
+    def _fetch_piece_bytes(self, piece_idx: int) -> Optional[bytes]:
+        plen = self.metadata.piece_size(piece_idx)
+        p_start = piece_idx * self.metadata.piece_length
+        p_end = p_start + plen
+        out = bytearray()
+
+        for fentry in self.metadata.files:
+            f_start = fentry.offset
+            f_end = f_start + fentry.length
+            ov_start = max(p_start, f_start)
+            ov_end = min(p_end, f_end)
+            if ov_start >= ov_end:
+                continue
+            rel_start = ov_start - f_start
+            rel_end = ov_end - f_start - 1
+            url = self._file_url(fentry)
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Range": f"bytes={rel_start}-{rel_end}",
+                    "User-Agent": "TorrentVideoTool/2.0 (BEP-0019)",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=8.0) as resp:
+                chunk = resp.read()
+                if len(chunk) != (rel_end - rel_start + 1):
+                    return None
+                out.extend(chunk)
+
+        return bytes(out) if len(out) == plen else None
+
+    def run(self) -> None:
+        while not self.stop_event.is_set() and not self.store.is_complete:
+            piece_idx = self.store.next_piece_to_download()
+            if piece_idx is None:
+                time.sleep(0.05)
+                continue
+            try:
+                data = self._fetch_piece_bytes(piece_idx)
+                if data is not None and self.store.verify_and_store_piece(piece_idx, data):
+                    continue
+                self.store.release_in_progress(piece_idx)
+            except Exception:
+                self.store.release_in_progress(piece_idx)
+                time.sleep(0.25)
+
+
 # ============================================================================
 # 7. High-Level Session Supporting BOTH `.torrent` Files AND `magnet:` Links
 # ============================================================================
@@ -1182,12 +1304,15 @@ class TorrentVideoSession:
         self.output_dir = Path(output_dir)
         self.peer_id = b"-TV0002-" + os.urandom(12)
         self.explicit_peers = list(peers) if peers else []
+        self.web_seeds: List[str] = []
         self.stop_event = threading.Event()
-        self.workers: List[PeerWorker] = []
+        self.workers: List[threading.Thread] = []
         self.stream_server: Optional[VideoStreamServer] = None
         self._embedded_seeder: Optional[_EmbeddedFixtureSeeder] = None
 
         if self.source_str.startswith("magnet:?"):
+            m_parsed = parse_magnet_uri(self.source_str)
+            self.web_seeds = list(m_parsed.web_seeds)
             self.metadata, discovered_peers = self._resolve_magnet(self.source_str)
             for p in discovered_peers:
                 if p not in self.explicit_peers:
@@ -1217,21 +1342,19 @@ class TorrentVideoSession:
         """
         Resolve a Magnet URI via:
         1. Explicit `x.pe` peers or registered local fixture seeder
-        2. Magnet `tr=` HTTP & UDP (BEP 0015) trackers + public tracker fallback list
+        2. Concurrent `tr=` HTTP & UDP (BEP 0015) tracker queries + public tracker fallback list
         3. Mainline DHT (BEP 0005 `get_peers`)
-        4. BEP 0009/0010 (`ut_metadata`) exchange over TCP
+        4. Parallel BEP 0009/0010 (`ut_metadata`) peer race across up to 35 peers concurrently!
         """
         m_info = parse_magnet_uri(magnet_uri)
         candidates = list(m_info.explicit_peers)
 
-        # Ensure default fixture is initialized in case the user pasted the fixture hash
         get_default_fixture_magnet()
         if m_info.info_hash.hex() in _GLOBAL_FIXTURE_SEEDERS:
             seeder = _GLOBAL_FIXTURE_SEEDERS[m_info.info_hash.hex()]
             if (seeder.host, seeder.port) not in candidates:
                 candidates.insert(0, (seeder.host, seeder.port))
 
-        # Combine magnet trackers with public fallback trackers if needed
         trackers = list(m_info.trackers)
         if not candidates:
             for pub_tr in DEFAULT_PUBLIC_TRACKERS:
@@ -1240,38 +1363,51 @@ class TorrentVideoSession:
 
         if trackers and not (m_info.info_hash.hex() in _GLOBAL_FIXTURE_SEEDERS):
             tracker_peers = discover_peers_from_trackers(
-                trackers, m_info.info_hash, self.peer_id
+                trackers, m_info.info_hash, self.peer_id, timeout=2.5
             )
             for tp in tracker_peers:
                 if tp not in candidates:
                     candidates.append(tp)
 
         if not candidates:
-            dht_peers = query_dht_for_peers(m_info.info_hash, timeout=3.5)
+            dht_peers = query_dht_for_peers(m_info.info_hash, timeout=3.0)
             for dp in dht_peers:
                 if dp not in candidates:
                     candidates.append(dp)
 
-        # Fetch info dictionary via BEP 0009/0010 ut_metadata from candidate peers
-        for peer_addr in candidates[:25]:
+        # Parallel BEP 0009/0010 ut_metadata race across up to 35 peers concurrently
+        if candidates:
+            pool_size = min(25, len(candidates))
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=pool_size)
             try:
-                info_dict = fetch_magnet_metadata_from_peer(
-                    peer_addr, m_info.info_hash, self.peer_id, timeout=3.5
-                )
-                if info_dict is not None:
-                    meta = TorrentMetadata.from_info_dict(
-                        info_dict,
-                        announce=trackers[0] if trackers else "",
-                        announce_list=trackers,
-                    )
-                    return meta, candidates
+                fut_map = {
+                    ex.submit(fetch_magnet_metadata_from_peer, peer_addr, m_info.info_hash, self.peer_id, 3.2): peer_addr
+                    for peer_addr in candidates[:35]
+                }
+                for fut in concurrent.futures.as_completed(fut_map, timeout=5.0):
+                    peer_addr = fut_map[fut]
+                    try:
+                        info_dict = fut.result()
+                        if info_dict is not None:
+                            meta = TorrentMetadata.from_info_dict(
+                                info_dict,
+                                announce=trackers[0] if trackers else "",
+                                announce_list=trackers,
+                            )
+                            # Put the responsive peer at the very front of the list
+                            ordered = [peer_addr] + [p for p in candidates if p != peer_addr]
+                            return meta, ordered
+                    except Exception:
+                        continue
             except Exception:
-                continue
+                pass
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
 
         raise RuntimeError(
             f"No active TCP peers responded with BEP 0009 ut_metadata for info_hash={m_info.info_hash.hex()} "
             f"(checked {len(trackers)} trackers, DHT, and {len(candidates)} peers). "
-            "Click '🧪 Load Test Fixture Magnet Link' or upload a .torrent file to test immediately."
+            "Try clicking one of the Online Magnet Presets (Sintel / Big Buck Bunny) or the Test Fixture Magnet."
         )
 
     def start_swarm(self) -> None:
@@ -1301,6 +1437,7 @@ class TorrentVideoSession:
                 )
                 discovered.append((self._embedded_seeder.host, self._embedded_seeder.port))
 
+        # Start TCP Peer Workers (BEP 0003)
         for peer_addr in discovered[:20]:
             worker = PeerWorker(
                 peer_addr=peer_addr,
@@ -1311,6 +1448,18 @@ class TorrentVideoSession:
             )
             worker.start()
             self.workers.append(worker)
+
+        # Start HTTP/HTTPS WebSeed Workers (BEP 0019) if present in magnet (`ws=`)
+        for ws_url in self.web_seeds:
+            for _ in range(2):  # 2 concurrent range workers per webseed for smooth HD streaming
+                ws_worker = WebSeedWorker(
+                    ws_base_url=ws_url,
+                    metadata=self.metadata,
+                    store=self.store,
+                    stop_event=self.stop_event,
+                )
+                ws_worker.start()
+                self.workers.append(ws_worker)
 
     def start_http_stream(self, host: str = "127.0.0.1", port: int = 0) -> str:
         self.stream_server = VideoStreamServer(self.store, host=host, port=port, session=self)
@@ -1465,8 +1614,8 @@ WEB_UI_HTML = """<!DOCTYPE html>
       background: #1e293b;
       color: #cbd5e1;
       border: 1px solid #334155;
-      font-size: 0.84rem;
-      padding: 9px 14px;
+      font-size: 0.82rem;
+      padding: 8px 13px;
     }
     .btn-fixture:hover { background: #334155; color: white; }
     .grid-2 {
@@ -1583,11 +1732,11 @@ WEB_UI_HTML = """<!DOCTYPE html>
   <div class="container">
     <header>
       <h1>⚡ BitTorrent Magnet Video Streamer & Downloader</h1>
-      <span class="badge">BEP 0003 + BEP 0009 Magnet + DHT + HTTP 206 Range</span>
+      <span class="badge">BEP 0003 + BEP 0009 Magnet + BEP 0019 + HTTP 206 Range</span>
     </header>
 
     <div class="card">
-      <label for="magnetInput">Paste Magnet Link (<code>magnet:?xt=urn:btih:...</code>) or Local <code>.torrent</code> Path</label>
+      <label for="magnetInput">Paste Any Magnet Link (<code>magnet:?xt=urn:btih:...</code>) or Local <code>.torrent</code> Path</label>
       <div class="input-row">
         <input
           id="magnetInput"
@@ -1600,7 +1749,9 @@ WEB_UI_HTML = """<!DOCTYPE html>
       <div class="btn-row">
         <button class="btn-stream" onclick="startSession('stream')">▶ Stream Video Now</button>
         <button class="btn-download" onclick="startSession('download')">⬇ Download Video</button>
-        <button class="btn-fixture" onclick="loadFixtureMagnet()">🧪 Load Test Fixture Magnet Link</button>
+        <button class="btn-fixture" onclick="loadFixtureMagnet('fixture')">🧪 Local H.264 Fixture (1 MB)</button>
+        <button class="btn-fixture" onclick="loadFixtureMagnet('sintel')">🎬 Sintel Online Magnet (129 MB)</button>
+        <button class="btn-fixture" onclick="loadFixtureMagnet('big_buck_bunny')">🐰 Big Buck Bunny Online Magnet (263 MB)</button>
         <a id="saveDiskLink" class="btn-link btn-fixture" style="display:none;" href="/download" download>💾 Save File to Browser</a>
       </div>
       <div id="statusBanner" class="status-banner"></div>
@@ -1653,11 +1804,11 @@ WEB_UI_HTML = """<!DOCTYPE html>
   <script>
     let pollTimer = null;
 
-    async function loadFixtureMagnet() {
-      const res = await fetch('/api/fixture-magnet');
+    async function loadFixtureMagnet(preset = 'fixture') {
+      const res = await fetch('/api/fixture-magnet?preset=' + encodeURIComponent(preset));
       const data = await res.json();
       document.getElementById('magnetInput').value = data.magnet;
-      showStatus('Loaded playable H.264 MP4 Test Fixture Magnet Link (BEP 0009 ut_metadata ready). Click Stream or Download!');
+      showStatus('Loaded ' + (data.label || preset) + ' Magnet Link. Click "▶ Stream Video Now" or "⬇ Download Video"!');
     }
 
     async function uploadTorrentFile(input) {
@@ -1945,8 +2096,19 @@ class VideoStreamServer:
                     return
 
                 if self.path.startswith("/api/fixture-magnet"):
-                    magnet = get_default_fixture_magnet()
-                    self._send_json(200, {"magnet": magnet})
+                    parsed_q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                    preset = parsed_q.get("preset", ["fixture"])[0].lower()
+                    if preset in ONLINE_MAGNET_PRESETS:
+                        self._send_json(200, {
+                            "magnet": ONLINE_MAGNET_PRESETS[preset],
+                            "label": preset.replace("_", " ").title() + " (Online Swarm)",
+                        })
+                    else:
+                        magnet = get_default_fixture_magnet()
+                        self._send_json(200, {
+                            "magnet": magnet,
+                            "label": "Local H.264 Test Fixture (1 MB)",
+                        })
                     return
 
                 if self.path.startswith("/status"):

@@ -491,6 +491,65 @@ class TorrentVideoToolTests(unittest.TestCase):
                 ui_server.active_session.close()
             ui_server.stop()
 
+    def test_5_real_online_magnet_links_sintel_and_big_buck_bunny(self) -> None:
+        """
+        Verify live online magnet links (Blender Foundation's Sintel 129 MB & Big Buck Bunny 263 MB):
+        - Resolves `.torrent` metadata from live internet peers via UDP trackers + BEP 0009 `ut_metadata`.
+        - Streams byte ranges from `Sintel.mp4` (both byte 0 MP4 `ftyp` header and a 50 MB seek offset)
+          with full SHA-1 piece verification.
+        """
+        from torrent_video_tool import ONLINE_MAGNET_PRESETS, TorrentVideoSession
+
+        # 1. Test Sintel (129.24 MB, 987 pieces) live magnet resolution + HTTP 206 Range streaming
+        sintel_magnet = ONLINE_MAGNET_PRESETS["sintel"]
+        session = TorrentVideoSession(
+            sintel_magnet,
+            self.work_dir / "sintel_online",
+            sliding_window_pieces=2,
+        )
+        try:
+            self.assertEqual(session.metadata.info_hash.hex(), "08ada5a7a6183aae1e09d831df6748d566095a10")
+            self.assertTrue(session.target_file.path.endswith("Sintel.mp4"))
+            self.assertEqual(session.target_file.length, 129241752)
+
+            stream_url = session.start_http_stream()
+            session.start_swarm()
+
+            # Stream first 32 KiB of Sintel.mp4 and verify MP4 `ftyp` signature
+            req_head = urllib.request.Request(stream_url, headers={"Range": "bytes=0-32767"})
+            with urllib.request.urlopen(req_head, timeout=15.0) as resp:
+                self.assertEqual(resp.status, 206)
+                head_bytes = resp.read()
+                self.assertEqual(len(head_bytes), 32768)
+                self.assertEqual(head_bytes[4:8], b"ftyp")
+
+            # Seek 50 MB into the 129 MB Sintel.mp4 movie and stream a 16 KiB range
+            seek_offset = 50 * 1024 * 1024
+            req_seek = urllib.request.Request(
+                stream_url,
+                headers={"Range": f"bytes={seek_offset}-{seek_offset + 16383}"},
+            )
+            with urllib.request.urlopen(req_seek, timeout=15.0) as resp:
+                self.assertEqual(resp.status, 206)
+                seek_bytes = resp.read()
+                self.assertEqual(len(seek_bytes), 16384)
+        finally:
+            session.close()
+
+        # 2. Test Big Buck Bunny (276.13 MB, 1055 pieces) live magnet resolution
+        bbb_magnet = ONLINE_MAGNET_PRESETS["big_buck_bunny"]
+        bbb_session = TorrentVideoSession(
+            bbb_magnet,
+            self.work_dir / "bbb_online",
+            sliding_window_pieces=2,
+        )
+        try:
+            self.assertEqual(bbb_session.metadata.info_hash.hex(), "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c")
+            self.assertTrue(bbb_session.target_file.path.endswith("Big Buck Bunny.mp4"))
+            self.assertEqual(bbb_session.target_file.length, 276134947)
+        finally:
+            bbb_session.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
