@@ -360,14 +360,17 @@ class SparseVideoPieceStore:
         self._lock = threading.Condition()
         self.completed_pieces: Set[int] = set()
         self.in_progress_pieces: Set[int] = set()
+        self.in_progress_since: Dict[int, float] = {}
         self._priority_cursor: int = self.first_piece
         self._urgent_pieces: List[int] = []
         self.bytes_downloaded: int = 0
         self.started_at: float = time.monotonic()
+        self._speed_samples: List[Tuple[float, int]] = []
 
-        # Pre-prioritize first piece(s) and last piece (for MP4 moov header/footer)
-        self._urgent_pieces.append(self.first_piece)
-        if self.last_piece != self.first_piece:
+        # Pre-prioritize first 4 pieces (header + initial frames) and last piece (MP4 moov atom)
+        for p in range(self.first_piece, min(self.last_piece + 1, self.first_piece + 4)):
+            self._urgent_pieces.append(p)
+        if self.last_piece not in self._urgent_pieces:
             self._urgent_pieces.append(self.last_piece)
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +401,7 @@ class SparseVideoPieceStore:
 
     def piece_states_snapshot(self) -> Dict[str, Any]:
         with self._lock:
+            now = time.monotonic()
             urgent_set = set(self._urgent_pieces)
             states = []
             for p in range(self.first_piece, self.last_piece + 1):
@@ -409,7 +413,15 @@ class SparseVideoPieceStore:
                     states.append("urgent")
                 else:
                     states.append("pending")
-            elapsed = max(0.001, time.monotonic() - self.started_at)
+            # Calculate rolling 3-second speed in B/s
+            self._speed_samples = [(t, b) for (t, b) in self._speed_samples if now - t <= 3.0]
+            if self._speed_samples:
+                dt = max(0.15, now - self._speed_samples[0][0])
+                recent_bytes = sum(b for _, b in self._speed_samples)
+                speed_bps = int(recent_bytes / dt)
+            else:
+                elapsed = max(0.001, now - self.started_at)
+                speed_bps = int(self.bytes_downloaded / elapsed) if not self.required_pieces.issubset(self.completed_pieces) else 0
             return {
                 "total_pieces": len(self.required_pieces),
                 "completed_pieces": len(self.completed_pieces & self.required_pieces),
@@ -417,7 +429,7 @@ class SparseVideoPieceStore:
                 "complete": self.required_pieces.issubset(self.completed_pieces),
                 "size": self.target_file.length,
                 "bytes_downloaded": self.bytes_downloaded,
-                "speed_bps": int(self.bytes_downloaded / elapsed),
+                "speed_bps": speed_bps,
                 "piece_length": self.metadata.piece_length,
                 "priority_cursor": self._priority_cursor,
                 "pieces": states,
@@ -442,39 +454,87 @@ class SparseVideoPieceStore:
             self._urgent_pieces = new_urgent
             self._lock.notify_all()
 
-    def next_piece_to_download(self, peer_bitfield: Optional[Set[int]] = None) -> Optional[int]:
+    def next_piece_to_download(self, peer_bitfield: Optional[Set[int]] = None, allow_steal_after: float = 0.7) -> Optional[int]:
         with self._lock:
-            def eligible(p: int) -> bool:
-                if p not in self.required_pieces:
-                    return False
-                if p in self.completed_pieces or p in self.in_progress_pieces:
+            now = time.monotonic()
+
+            def eligible(p: int, can_steal: bool = False) -> bool:
+                if p not in self.required_pieces or p in self.completed_pieces:
                     return False
                 if peer_bitfield is not None and p not in peer_bitfield:
+                    return False
+                if p in self.in_progress_pieces:
+                    if can_steal and (now - self.in_progress_since.get(p, now)) >= allow_steal_after:
+                        return True
                     return False
                 return True
 
             while self._urgent_pieces and self._urgent_pieces[0] in self.completed_pieces:
                 self._urgent_pieces.pop(0)
+
+            # 1. Unclaimed urgent pieces first
             for p in self._urgent_pieces:
-                if eligible(p):
+                if eligible(p, can_steal=False):
                     self.in_progress_pieces.add(p)
+                    self.in_progress_since[p] = now
                     return p
 
+            # 2. Steal slow in-progress urgent pieces (Endgame / Straggler protection for streaming)
+            for p in self._urgent_pieces:
+                if eligible(p, can_steal=True):
+                    self.in_progress_since[p] = now
+                    return p
+
+            # 3. Sequential pieces from priority cursor
             for p in range(self._priority_cursor, self.last_piece + 1):
-                if eligible(p):
+                if eligible(p, can_steal=False):
                     self.in_progress_pieces.add(p)
+                    self.in_progress_since[p] = now
                     return p
 
+            # 4. Wrap around to earlier missing pieces
             for p in range(self.first_piece, self._priority_cursor):
-                if eligible(p):
+                if eligible(p, can_steal=False):
                     self.in_progress_pieces.add(p)
+                    self.in_progress_since[p] = now
+                    return p
+
+            # 5. Endgame mode: if all remaining pieces are in-progress on slow peers, race them
+            for p in self.required_pieces - self.completed_pieces:
+                if eligible(p, can_steal=True):
+                    self.in_progress_since[p] = now
                     return p
 
             return None
 
+    def next_piece_batch_to_download(self, max_batch: int = 4) -> List[int]:
+        """
+        Claim up to `max_batch` contiguous pieces so HTTP Keep-Alive WebSeed workers can
+        coalesce multiple adjacent pieces into a single large HTTP `Range` request.
+        """
+        first = self.next_piece_to_download()
+        if first is None:
+            return []
+        batch = [first]
+        with self._lock:
+            now = time.monotonic()
+            for nxt in range(first + 1, min(self.last_piece + 1, first + max_batch)):
+                if (
+                    nxt in self.required_pieces
+                    and nxt not in self.completed_pieces
+                    and nxt not in self.in_progress_pieces
+                ):
+                    self.in_progress_pieces.add(nxt)
+                    self.in_progress_since[nxt] = now
+                    batch.append(nxt)
+                else:
+                    break
+        return batch
+
     def release_in_progress(self, piece_index: int) -> None:
         with self._lock:
             self.in_progress_pieces.discard(piece_index)
+            self.in_progress_since.pop(piece_index, None)
             self._lock.notify_all()
 
     def verify_and_store_piece(self, piece_index: int, data: bytes) -> bool:
@@ -502,7 +562,9 @@ class SparseVideoPieceStore:
 
             if piece_index not in self.completed_pieces:
                 self.bytes_downloaded += len(data)
+                self._speed_samples.append((time.monotonic(), len(data)))
             self.in_progress_pieces.discard(piece_index)
+            self.in_progress_since.pop(piece_index, None)
             self.completed_pieces.add(piece_index)
             self._lock.notify_all()
         return True
@@ -1211,11 +1273,22 @@ ONLINE_MAGNET_PRESETS: Dict[str, str] = {
 }
 
 
+import http.client
+
+_KNOWN_WEBSEEDS_BY_HASH: Dict[str, List[str]] = {
+    "08ada5a7a6183aae1e09d831df6748d566095a10": ["https://webtorrent.io/torrents/"],
+    "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c": ["https://webtorrent.io/torrents/"],
+    "209c8226b299b308beaf2b9cd3fb49212dbd13ec": ["https://webtorrent.io/torrents/"],
+    "c9e15763f722f23e98a29decdfae341b98d53056": ["https://webtorrent.io/torrents/"],
+}
+
+
 class WebSeedWorker(threading.Thread):
     """
-    BEP 0019 HTTP/HTTPS WebSeed Worker (`ws=` in magnet links / `url-list` in torrents).
-    Downloads pieces via HTTP `Range` requests across single- or multi-file layouts
-    and verifies every piece's 20-byte SHA-1 hash before storing in `SparseVideoPieceStore`.
+    High-Throughput BEP 0019 HTTP/HTTPS WebSeed Worker (`ws=` in magnet links).
+    Uses persistent HTTP/1.1 Keep-Alive connections (`http.client.HTTPSConnection`)
+    and coalesces up to 4 contiguous pieces (512 KiB) per HTTP `Range` request,
+    verifying every piece's 20-byte SHA-1 hash before storing in `SparseVideoPieceStore`.
     """
 
     def __init__(
@@ -1230,6 +1303,8 @@ class WebSeedWorker(threading.Thread):
         self.metadata = metadata
         self.store = store
         self.stop_event = stop_event
+        self._conn: Optional[http.client.HTTPConnection] = None
+        self._conn_host: str = ""
 
     def _file_url(self, file_entry: TorrentFileEntry) -> str:
         quoted_path = "/".join(urllib.parse.quote(part) for part in file_entry.path.split("/"))
@@ -1239,12 +1314,59 @@ class WebSeedWorker(threading.Thread):
             return self.ws_base_url
         return self.ws_base_url + "/" + quoted_path
 
-    def _fetch_piece_bytes(self, piece_idx: int) -> Optional[bytes]:
-        plen = self.metadata.piece_size(piece_idx)
-        p_start = piece_idx * self.metadata.piece_length
-        p_end = p_start + plen
-        out = bytearray()
+    def _range_get_keepalive(self, url: str, start_byte: int, end_byte: int) -> Optional[bytes]:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.netloc
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
 
+        for _attempt in range(2):
+            try:
+                if self._conn is None or self._conn_host != host:
+                    if self._conn is not None:
+                        try:
+                            self._conn.close()
+                        except Exception:
+                            pass
+                    if parsed.scheme == "https":
+                        self._conn = http.client.HTTPSConnection(host, timeout=6.0)
+                    else:
+                        self._conn = http.client.HTTPConnection(host, timeout=6.0)
+                    self._conn_host = host
+
+                self._conn.request(
+                    "GET",
+                    path,
+                    headers={
+                        "Host": host,
+                        "Range": f"bytes={start_byte}-{end_byte}",
+                        "Connection": "keep-alive",
+                        "User-Agent": "TorrentVideoTool/2.5 (BEP-0019-KeepAlive)",
+                    },
+                )
+                resp = self._conn.getresponse()
+                if resp.status in (301, 302, 303, 307, 308):
+                    loc = resp.getheader("Location")
+                    resp.read()
+                    if loc:
+                        return self._range_get_keepalive(loc, start_byte, end_byte)
+                    return None
+                data = resp.read()
+                if resp.status in (200, 206) and len(data) == (end_byte - start_byte + 1):
+                    return data
+                return None
+            except Exception:
+                try:
+                    if self._conn is not None:
+                        self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+        return None
+
+    def _fetch_piece_span(self, p_start: int, p_end: int) -> Optional[bytes]:
+        out = bytearray()
         for fentry in self.metadata.files:
             f_start = fentry.offset
             f_end = f_start + fentry.length
@@ -1255,35 +1377,46 @@ class WebSeedWorker(threading.Thread):
             rel_start = ov_start - f_start
             rel_end = ov_end - f_start - 1
             url = self._file_url(fentry)
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "Range": f"bytes={rel_start}-{rel_end}",
-                    "User-Agent": "TorrentVideoTool/2.0 (BEP-0019)",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=8.0) as resp:
-                chunk = resp.read()
-                if len(chunk) != (rel_end - rel_start + 1):
-                    return None
-                out.extend(chunk)
-
-        return bytes(out) if len(out) == plen else None
+            chunk = self._range_get_keepalive(url, rel_start, rel_end)
+            if chunk is None:
+                return None
+            out.extend(chunk)
+        return bytes(out) if len(out) == (p_end - p_start) else None
 
     def run(self) -> None:
-        while not self.stop_event.is_set() and not self.store.is_complete:
-            piece_idx = self.store.next_piece_to_download()
-            if piece_idx is None:
-                time.sleep(0.05)
-                continue
-            try:
-                data = self._fetch_piece_bytes(piece_idx)
-                if data is not None and self.store.verify_and_store_piece(piece_idx, data):
+        try:
+            while not self.stop_event.is_set() and not self.store.is_complete:
+                batch = self.store.next_piece_batch_to_download(max_batch=4)
+                if not batch:
+                    time.sleep(0.02)
                     continue
-                self.store.release_in_progress(piece_idx)
-            except Exception:
-                self.store.release_in_progress(piece_idx)
-                time.sleep(0.25)
+                first_idx = batch[0]
+                last_idx = batch[-1]
+                span_start = first_idx * self.metadata.piece_length
+                span_end = last_idx * self.metadata.piece_length + self.metadata.piece_size(last_idx)
+                try:
+                    raw_span = self._fetch_piece_span(span_start, span_end)
+                    if raw_span is not None:
+                        offset = 0
+                        for pidx in batch:
+                            plen = self.metadata.piece_size(pidx)
+                            pdata = raw_span[offset:offset + plen]
+                            offset += plen
+                            if not self.store.verify_and_store_piece(pidx, pdata):
+                                self.store.release_in_progress(pidx)
+                        continue
+                    for pidx in batch:
+                        self.store.release_in_progress(pidx)
+                except Exception:
+                    for pidx in batch:
+                        self.store.release_in_progress(pidx)
+                    time.sleep(0.1)
+        finally:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
 
 
 # ============================================================================
@@ -1298,7 +1431,7 @@ class TorrentVideoSession:
         source: str | Path,
         output_dir: str | Path,
         peers: Optional[List[Tuple[str, int]]] = None,
-        sliding_window_pieces: int = 8,
+        sliding_window_pieces: int = 16,
     ) -> None:
         self.source_str = str(source).strip()
         self.output_dir = Path(output_dir)
@@ -1313,6 +1446,9 @@ class TorrentVideoSession:
         if self.source_str.startswith("magnet:?"):
             m_parsed = parse_magnet_uri(self.source_str)
             self.web_seeds = list(m_parsed.web_seeds)
+            for known_ws in _KNOWN_WEBSEEDS_BY_HASH.get(m_parsed.info_hash.hex(), []):
+                if known_ws not in self.web_seeds:
+                    self.web_seeds.append(known_ws)
             self.metadata, discovered_peers = self._resolve_magnet(self.source_str)
             for p in discovered_peers:
                 if p not in self.explicit_peers:
@@ -1328,6 +1464,9 @@ class TorrentVideoSession:
                 if payload_candidate.exists():
                     ensure_demo_fixture(self.torrent_path)
             self.metadata = TorrentMetadata.from_file(self.torrent_path)
+            for known_ws in _KNOWN_WEBSEEDS_BY_HASH.get(self.metadata.info_hash.hex(), []):
+                if known_ws not in self.web_seeds:
+                    self.web_seeds.append(known_ws)
 
         self.target_file = self.metadata.select_video_file()
         self.output_path = self.output_dir / Path(self.target_file.path).name
@@ -1363,7 +1502,7 @@ class TorrentVideoSession:
 
         if trackers and not (m_info.info_hash.hex() in _GLOBAL_FIXTURE_SEEDERS):
             tracker_peers = discover_peers_from_trackers(
-                trackers, m_info.info_hash, self.peer_id, timeout=2.5
+                trackers, m_info.info_hash, self.peer_id, timeout=2.2
             )
             for tp in tracker_peers:
                 if tp not in candidates:
@@ -1394,7 +1533,6 @@ class TorrentVideoSession:
                                 announce=trackers[0] if trackers else "",
                                 announce_list=trackers,
                             )
-                            # Put the responsive peer at the very front of the list
                             ordered = [peer_addr] + [p for p in candidates if p != peer_addr]
                             return meta, ordered
                     except Exception:
@@ -1412,7 +1550,8 @@ class TorrentVideoSession:
 
     def start_swarm(self) -> None:
         discovered = list(self.explicit_peers)
-        if self.metadata.announce_list and self.metadata.info_hash.hex() not in _GLOBAL_FIXTURE_SEEDERS:
+        # Only block on tracker discovery if we don't already have peers from _resolve_magnet
+        if not discovered and self.metadata.announce_list and self.metadata.info_hash.hex() not in _GLOBAL_FIXTURE_SEEDERS:
             for p in discover_peers_from_trackers(
                 self.metadata.announce_list,
                 self.metadata.info_hash,
@@ -1437,8 +1576,20 @@ class TorrentVideoSession:
                 )
                 discovered.append((self._embedded_seeder.host, self._embedded_seeder.port))
 
-        # Start TCP Peer Workers (BEP 0003)
-        for peer_addr in discovered[:20]:
+        # 1. Start 8 Persistent HTTP/1.1 Keep-Alive WebSeed Workers (BEP 0019) immediately
+        for ws_url in self.web_seeds:
+            for _ in range(8):
+                ws_worker = WebSeedWorker(
+                    ws_base_url=ws_url,
+                    metadata=self.metadata,
+                    store=self.store,
+                    stop_event=self.stop_event,
+                )
+                ws_worker.start()
+                self.workers.append(ws_worker)
+
+        # 2. Start up to 35 concurrent TCP Peer Workers (BEP 0003)
+        for peer_addr in discovered[:35]:
             worker = PeerWorker(
                 peer_addr=peer_addr,
                 metadata=self.metadata,
@@ -1448,18 +1599,6 @@ class TorrentVideoSession:
             )
             worker.start()
             self.workers.append(worker)
-
-        # Start HTTP/HTTPS WebSeed Workers (BEP 0019) if present in magnet (`ws=`)
-        for ws_url in self.web_seeds:
-            for _ in range(2):  # 2 concurrent range workers per webseed for smooth HD streaming
-                ws_worker = WebSeedWorker(
-                    ws_base_url=ws_url,
-                    metadata=self.metadata,
-                    store=self.store,
-                    stop_event=self.stop_event,
-                )
-                ws_worker.start()
-                self.workers.append(ws_worker)
 
     def start_http_stream(self, host: str = "127.0.0.1", port: int = 0) -> str:
         self.stream_server = VideoStreamServer(self.store, host=host, port=port, session=self)
@@ -1905,8 +2044,9 @@ WEB_UI_HTML = """<!DOCTYPE html>
         if (!st.active) return;
 
         const pct = Math.round((st.progress || 0) * 100);
+        const speedStr = st.speed_bps ? ' • ' + formatBytes(st.speed_bps) + '/s' : '';
         document.getElementById('statProgress').textContent =
-          pct + '% (' + st.completed_pieces + '/' + st.total_pieces + ' pieces)';
+          pct + '% (' + st.completed_pieces + '/' + st.total_pieces + ')' + speedStr;
         document.getElementById('progressBar').style.width = pct + '%';
 
         const grid = document.getElementById('pieceGrid');
@@ -1991,7 +2131,7 @@ class VideoStreamServer:
         store: Optional[SparseVideoPieceStore] = None,
         host: str = "127.0.0.1",
         port: int = 0,
-        stream_chunk_size: int = 65536,
+        stream_chunk_size: int = 262144,
         output_dir: str | Path = "./downloads",
         session: Optional[TorrentVideoSession] = None,
     ) -> None:
@@ -2067,7 +2207,7 @@ class VideoStreamServer:
                     if not source:
                         source = get_default_fixture_magnet()
                     try:
-                        sess = TorrentVideoSession(source, outer.output_dir, sliding_window_pieces=4)
+                        sess = TorrentVideoSession(source, outer.output_dir, sliding_window_pieces=16)
                         sess.start_swarm()
                         outer.switch_session(sess)
                         self._send_json(200, {
