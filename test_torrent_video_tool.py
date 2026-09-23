@@ -599,6 +599,17 @@ class TorrentVideoToolTests(unittest.TestCase):
                 self.assertEqual(chunk[:4], b"\x1a\x45\xdf\xa3")
                 self.assertIn(b"matroska", chunk[:64])
                 self.assertIn(b"V_MPEGH/ISO/HEVC", chunk)
+
+            # Verify fast mid-movie HTTP 206 Range seek (1.5 GB into the 5.96 GB MKV, 6.51 MiB inside Piece 178)
+            seek_offset = 1500000000
+            seek_req = urllib.request.Request(
+                stream_url,
+                headers={"Range": f"bytes={seek_offset}-{seek_offset + 65535}"},
+            )
+            with urllib.request.urlopen(seek_req, timeout=15.0) as seek_resp:
+                self.assertEqual(seek_resp.status, 206)
+                seek_chunk = seek_resp.read()
+                self.assertEqual(len(seek_chunk), 65536)
         finally:
             session.close()
 
