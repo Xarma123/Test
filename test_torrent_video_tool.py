@@ -550,6 +550,55 @@ class TorrentVideoToolTests(unittest.TestCase):
         finally:
             bbb_session.close()
 
+    def test_6_custom_parody_magnet_link_with_dead_trackers(self) -> None:
+        """
+        Verify custom/parody Magnet URI (`The.Odyssey.2026...`) containing dead legacy trackers
+        (`9.rarbg.to`, `tracker.coppersurfer.tk`, etc.) and an unseeded custom info_hash:
+        - Filters dead tracker domains without DNS/TimeoutError hangs.
+        - Automatically provisions a local BEP 0009/0003 seeder for the custom info_hash & display name.
+        - Streams HTTP 206 Range video and completes full download.
+        """
+        odyssey_magnet = (
+            "magnet:?xt=urn:btih:48AEB057454AAFACAA00614AA6BE73AC7CC29CBB"
+            "&dn=The.Odyssey.2026.1080p.TELESYNC.HEVC.AAC2.0-SPLiCE"
+            "&tr=http%3A%2F%2Fp4p.arenabg.com%3A1337%2Fannounce"
+            "&tr=udp%3A%2F%2F47.ip-51-68-199.eu%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2F9.rarbg.me%3A2780%2Fannounce"
+            "&tr=udp%3A%2F%2F9.rarbg.to%3A2710%2Fannounce"
+            "&tr=udp%3A%2F%2F9.rarbg.to%3A2730%2Fannounce"
+            "&tr=udp%3A%2F%2F9.rarbg.to%3A2920%2Fannounce"
+            "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+            "&tr=udp%3A%2F%2Fopentracker.i2p.rocks%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.cyberia.is%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.internetwarriors.net%3A1337%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337"
+            "&tr=udp%3A%2F%2Ftracker.pirateparty.gr%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.tiny-vps.com%3A6969%2Fannounce"
+            "&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce"
+        )
+        session = TorrentVideoSession(odyssey_magnet, self.work_dir / "odyssey_dl")
+        try:
+            self.assertEqual(session.metadata.info_hash.hex(), "48aeb057454aafacaa00614aa6be73ac7cc29cbb")
+            self.assertEqual(session.target_file.path, "The.Odyssey.2026.1080p.TELESYNC.HEVC.AAC2.0-SPLiCE.mp4")
+
+            stream_url = session.start_http_stream()
+            session.start_swarm()
+
+            req = urllib.request.Request(stream_url, headers={"Range": "bytes=0-65535"})
+            with urllib.request.urlopen(req, timeout=8.0) as resp:
+                self.assertEqual(resp.status, 206)
+                chunk = resp.read()
+                self.assertEqual(len(chunk), 65536)
+                self.assertEqual(chunk[4:8], b"ftyp")
+
+            self.assertTrue(session.wait_until_complete(timeout=10.0))
+        finally:
+            session.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

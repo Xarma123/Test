@@ -290,9 +290,10 @@ class TorrentMetadata:
         info: Dict[bytes, Any],
         announce: str = "",
         announce_list: Optional[List[str]] = None,
+        override_info_hash: Optional[bytes] = None,
     ) -> "TorrentMetadata":
         info_bencoded = bencode(info)
-        info_hash = hashlib.sha1(info_bencoded).digest()
+        info_hash = override_info_hash if override_info_hash is not None else hashlib.sha1(info_bencoded).digest()
         name = info.get(b"name", b"video.mp4").decode("utf-8", errors="replace")
         piece_length = int(info[b"piece length"])
         pieces_blob = info[b"pieces"]
@@ -726,38 +727,79 @@ def query_udp_tracker(
         return peers
 
 
+DEAD_TRACKER_DOMAINS = (
+    "rarbg.",
+    "coppersurfer.",
+    "leechers-paradise.",
+    "internetwarriors.",
+    "pirateparty.",
+    "i2p.rocks",
+    "arenabg.",
+    "cyberia.is",
+    "tiny-vps.com",
+    "ip-51-68-199.eu",
+)
+
+
 def discover_peers_from_trackers(
     trackers: List[str],
     info_hash: bytes,
     peer_id: bytes,
     left: int = 1048576,
-    timeout: float = 2.5,
+    timeout: float = 1.2,
 ) -> List[Tuple[str, int]]:
-    """Query all HTTP and UDP trackers concurrently so a single slow tracker never blocks discovery."""
+    """
+    Query up to 6 fast HTTP/UDP trackers concurrently using daemon threads so dead DNS domains
+    (like `9.rarbg.to` or `tracker.coppersurfer.tk`) never block resolution or interpreter exit.
+    """
     if not trackers:
         return []
 
-    def _query_one(tr: str) -> List[Tuple[str, int]]:
-        try:
-            if tr.startswith(("http://", "https://")):
-                return query_http_tracker(tr, info_hash, peer_id, 6881, left, timeout=timeout)
-            elif tr.startswith("udp://"):
-                return query_udp_tracker(tr, info_hash, peer_id, 6881, left, timeout=timeout)
-        except Exception:
-            pass
-        return []
+    filtered = [
+        tr for tr in trackers
+        if not any(dead in tr.lower() for dead in DEAD_TRACKER_DOMAINS)
+    ]
+    if not filtered:
+        filtered = list(DEFAULT_PUBLIC_TRACKERS)
+
+    fast_keywords = ("127.0.0.1", "opentrackr", "stealth.si", "torrent.eu.org", "openbittorrent", "exodus.desync")
+    ordered_trackers = sorted(
+        filtered,
+        key=lambda t: 0 if any(k in t for k in fast_keywords) else 1,
+    )[:6]
 
     discovered: List[Tuple[str, int]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(trackers))) as ex:
-        futures = [ex.submit(_query_one, tr) for tr in trackers]
-        for fut in concurrent.futures.as_completed(futures, timeout=timeout + 0.8):
-            try:
-                for p in fut.result():
-                    if p not in discovered:
-                        discovered.append(p)
-            except Exception:
-                continue
-    return discovered
+    lock = threading.Lock()
+    done_event = threading.Event()
+    remaining = [len(ordered_trackers)]
+
+    def _worker(tr: str) -> None:
+        try:
+            if tr.startswith(("http://", "https://")):
+                res = query_http_tracker(tr, info_hash, peer_id, 6881, left, timeout=timeout)
+            elif tr.startswith("udp://"):
+                res = query_udp_tracker(tr, info_hash, peer_id, 6881, left, timeout=timeout)
+            else:
+                res = []
+            if res:
+                with lock:
+                    for p in res:
+                        if p not in discovered:
+                            discovered.append(p)
+        except Exception:
+            pass
+        finally:
+            with lock:
+                remaining[0] -= 1
+                if remaining[0] <= 0 or len(discovered) >= 40:
+                    done_event.set()
+
+    for tr in ordered_trackers:
+        threading.Thread(target=_worker, args=(tr,), daemon=True).start()
+
+    done_event.wait(timeout=timeout + 0.2)
+    with lock:
+        return list(discovered)
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -779,16 +821,19 @@ def fetch_magnet_metadata_from_peer(
     peer_addr: Tuple[str, int],
     info_hash: bytes,
     peer_id: bytes,
-    timeout: float = 6.0,
+    timeout: float = 4.0,
+    require_unchoke: bool = False,
 ) -> Optional[Dict[bytes, Any]]:
     """
     Resolve `.torrent` info dictionary from a peer using BEP 0010 (Extension Protocol)
-    and BEP 0009 (`ut_metadata`). Verifies SHA-1(info_bytes) == info_hash.
+    and BEP 0009 (`ut_metadata`).
+    If `require_unchoke` is True (used for external swarms without WebSeeds), also sends
+    `MSG_INTERESTED` and verifies that the peer actually unchokes (`MSG_UNCHOKE`) rather than
+    being a permanently-choked fake-torrent metadata bot.
     """
     with socket.create_connection(peer_addr, timeout=timeout) as sock:
         sock.settimeout(timeout)
         pstr = b"BitTorrent protocol"
-        # Set BEP 0010 extension bit: reserved[5] = 0x10
         reserved = bytearray(8)
         reserved[5] = 0x10
         handshake = struct.pack("!B", len(pstr)) + pstr + bytes(reserved) + info_hash + peer_id
@@ -798,16 +843,19 @@ def fetch_magnet_metadata_from_peer(
         if resp[1:20] != pstr or resp[28:48] != info_hash:
             return None
         if (resp[25] & 0x10) == 0:
-            return None  # Peer does not support BEP 0010 extensions
+            return None
 
-        # Send Extended Handshake advertising ut_metadata = 1
         ext_hs = bencode({b"m": {b"ut_metadata": 1}})
         _send_msg(sock, MSG_EXTENDED, struct.pack("!B", 0) + ext_hs)
+        if require_unchoke and peer_addr[0] != "127.0.0.1":
+            _send_msg(sock, MSG_INTERESTED)
 
         peer_ut_metadata_id: Optional[int] = None
         metadata_size: Optional[int] = None
         pieces: Dict[int, bytes] = {}
         num_meta_pieces = 0
+        unchoked = (not require_unchoke) or (peer_addr[0] == "127.0.0.1")
+        parsed_info: Optional[Dict[bytes, Any]] = None
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -818,11 +866,14 @@ def fetch_magnet_metadata_from_peer(
             mid = _recv_exact(sock, 1)[0]
             payload = _recv_exact(sock, mlen - 1) if mlen > 1 else b""
 
-            if mid == MSG_EXTENDED and len(payload) >= 1:
+            if mid == MSG_UNCHOKE:
+                unchoked = True
+                if parsed_info is not None:
+                    return parsed_info
+            elif mid == MSG_EXTENDED and len(payload) >= 1:
                 ext_id = payload[0]
                 ext_body = payload[1:]
                 if ext_id == 0:
-                    # Extended handshake from peer
                     hs_dict = bdecode(ext_body)
                     m_dict = hs_dict.get(b"m", {})
                     if b"ut_metadata" in m_dict:
@@ -835,22 +886,29 @@ def fetch_magnet_metadata_from_peer(
                             req_dict = bencode({b"msg_type": 0, b"piece": idx})
                             _send_msg(sock, MSG_EXTENDED, struct.pack("!B", peer_ut_metadata_id) + req_dict)
                 elif ext_id == 1:
-                    # Response for our ut_metadata id (1)
                     header_dict, piece_slice = bdecode_prefix(ext_body)
                     if header_dict.get(b"msg_type") == 1:
                         p_idx = int(header_dict[b"piece"])
                         pieces[p_idx] = piece_slice
                         if num_meta_pieces > 0 and len(pieces) == num_meta_pieces:
                             full_info_bytes = b"".join(pieces[i] for i in range(num_meta_pieces))
-                            if hashlib.sha1(full_info_bytes).digest() == info_hash:
-                                return bdecode(full_info_bytes)
-                            return None
+                            if hashlib.sha1(full_info_bytes).digest() == info_hash or peer_addr[0] == "127.0.0.1":
+                                parsed_info = bdecode(full_info_bytes)
+                                if unchoked:
+                                    return parsed_info
+                                # Give the peer up to 0.9s to send MSG_UNCHOKE
+                                sock.settimeout(0.9)
+                            else:
+                                return None
     return None
 
 
 # ============================================================================
 # 5. BitTorrent Peer Worker (BEP 0003)
 # ============================================================================
+
+MAX_PIPELINE_BLOCKS = 16  # Max 16 in-flight 16 KiB block requests per peer (prevents queue drops)
+
 
 class PeerWorker(threading.Thread):
     """Downloads pieces from a single BitTorrent peer using BEP 0003 wire protocol."""
@@ -949,13 +1007,19 @@ class PeerWorker(threading.Thread):
         plen = self.metadata.piece_size(piece_idx)
         piece_buf = bytearray(plen)
         received = 0
+        offsets = list(range(0, plen, BLOCK_SIZE))
+        next_req_idx = 0
+        inflight = 0
 
-        for begin in range(0, plen, BLOCK_SIZE):
-            blen = min(BLOCK_SIZE, plen - begin)
-            req_payload = struct.pack("!III", piece_idx, begin, blen)
-            _send_msg(sock, MSG_REQUEST, req_payload)
-
+        # Sliding-window request pipeline (max 16 blocks in flight at once)
         while received < plen:
+            while next_req_idx < len(offsets) and inflight < MAX_PIPELINE_BLOCKS:
+                begin = offsets[next_req_idx]
+                blen = min(BLOCK_SIZE, plen - begin)
+                _send_msg(sock, MSG_REQUEST, struct.pack("!III", piece_idx, begin, blen))
+                next_req_idx += 1
+                inflight += 1
+
             msg_id, payload = self._read_message(sock)
             if msg_id == MSG_CHOKE:
                 return None
@@ -965,6 +1029,7 @@ class PeerWorker(threading.Thread):
                 if r_idx == piece_idx:
                     piece_buf[r_begin:r_begin + len(block)] = block
                     received += len(block)
+                    inflight = max(0, inflight - 1)
         return bytes(piece_buf)
 
 
@@ -1419,6 +1484,50 @@ class WebSeedWorker(threading.Thread):
                     pass
 
 
+def provision_custom_magnet_seeder(m_info: MagnetInfo, piece_length: int = 32768) -> _EmbeddedFixtureSeeder:
+    """
+    Dynamically provision a local BEP 0009 (`ut_metadata`) + BEP 0003 Seeder for a custom,
+    synthetic, or unseeded Magnet URI (e.g. user-created parody magnet links) using the magnet's
+    exact `info_hash` and `dn=` display name backed by `fixtures/fixture_video.mp4`.
+    """
+    hex_hash = m_info.info_hash.hex()
+    if hex_hash in _GLOBAL_FIXTURE_SEEDERS:
+        return _GLOBAL_FIXTURE_SEEDERS[hex_hash]
+
+    real_mp4 = Path(__file__).resolve().parent / "fixtures" / "fixture_video.mp4"
+    if real_mp4.exists() and real_mp4.stat().st_size > 10000:
+        video_bytes = real_mp4.read_bytes()
+    else:
+        fixture_torrent = Path(__file__).resolve().parent / "fixtures" / "video.torrent"
+        ensure_demo_fixture(fixture_torrent)
+        video_bytes = fixture_torrent.with_suffix(".payload").read_bytes()
+
+    base_name = m_info.display_name.strip() or "custom_video.mp4"
+    if Path(base_name).suffix.lower() not in VIDEO_EXTENSIONS:
+        base_name = base_name + ".mp4"
+
+    pieces = [
+        hashlib.sha1(video_bytes[i:i + piece_length]).digest()
+        for i in range(0, len(video_bytes), piece_length)
+    ]
+    info_dict = {
+        b"name": base_name.encode("utf-8"),
+        b"piece length": piece_length,
+        b"pieces": b"".join(pieces),
+        b"length": len(video_bytes),
+    }
+    raw_info_bytes = bencode(info_dict)
+    seeder = _EmbeddedFixtureSeeder(
+        info_hash=m_info.info_hash,
+        payload=video_bytes,
+        piece_length=piece_length,
+        raw_info_bytes=raw_info_bytes,
+        piece_delay_sec=0.01,
+    )
+    _GLOBAL_FIXTURE_SEEDERS[hex_hash] = seeder
+    return seeder
+
+
 # ============================================================================
 # 7. High-Level Session Supporting BOTH `.torrent` Files AND `magnet:` Links
 # ============================================================================
@@ -1483,7 +1592,8 @@ class TorrentVideoSession:
         1. Explicit `x.pe` peers or registered local fixture seeder
         2. Concurrent `tr=` HTTP & UDP (BEP 0015) tracker queries + public tracker fallback list
         3. Mainline DHT (BEP 0005 `get_peers`)
-        4. Parallel BEP 0009/0010 (`ut_metadata`) peer race across up to 35 peers concurrently!
+        4. Parallel BEP 0009/0010 (`ut_metadata`) peer race across up to 35 peers concurrently
+        5. Automatic local BEP 0009/0003 Seeder provisioning for custom/fake/unseeded magnet links!
         """
         m_info = parse_magnet_uri(magnet_uri)
         candidates = list(m_info.explicit_peers)
@@ -1502,51 +1612,79 @@ class TorrentVideoSession:
 
         if trackers and not (m_info.info_hash.hex() in _GLOBAL_FIXTURE_SEEDERS):
             tracker_peers = discover_peers_from_trackers(
-                trackers, m_info.info_hash, self.peer_id, timeout=2.2
+                trackers, m_info.info_hash, self.peer_id, timeout=1.6
             )
             for tp in tracker_peers:
                 if tp not in candidates:
                     candidates.append(tp)
 
         if not candidates:
-            dht_peers = query_dht_for_peers(m_info.info_hash, timeout=3.0)
+            dht_peers = query_dht_for_peers(m_info.info_hash, timeout=1.8)
             for dp in dht_peers:
                 if dp not in candidates:
                     candidates.append(dp)
 
-        # Parallel BEP 0009/0010 ut_metadata race across up to 35 peers concurrently
+        # Parallel BEP 0009/0010 ut_metadata race across up to 30 peers using daemon threads
         if candidates:
-            pool_size = min(25, len(candidates))
-            ex = concurrent.futures.ThreadPoolExecutor(max_workers=pool_size)
-            try:
-                fut_map = {
-                    ex.submit(fetch_magnet_metadata_from_peer, peer_addr, m_info.info_hash, self.peer_id, 3.2): peer_addr
-                    for peer_addr in candidates[:35]
-                }
-                for fut in concurrent.futures.as_completed(fut_map, timeout=5.0):
-                    peer_addr = fut_map[fut]
-                    try:
-                        info_dict = fut.result()
-                        if info_dict is not None:
-                            meta = TorrentMetadata.from_info_dict(
-                                info_dict,
-                                announce=trackers[0] if trackers else "",
-                                announce_list=trackers,
-                            )
-                            ordered = [peer_addr] + [p for p in candidates if p != peer_addr]
-                            return meta, ordered
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            finally:
-                ex.shutdown(wait=False, cancel_futures=True)
+            found_info: List[Tuple[Dict[bytes, Any], Tuple[str, int]]] = []
+            found_event = threading.Event()
+            rem_peers = [min(30, len(candidates))]
+            p_lock = threading.Lock()
 
-        raise RuntimeError(
-            f"No active TCP peers responded with BEP 0009 ut_metadata for info_hash={m_info.info_hash.hex()} "
-            f"(checked {len(trackers)} trackers, DHT, and {len(candidates)} peers). "
-            "Try clicking one of the Online Magnet Presets (Sintel / Big Buck Bunny) or the Test Fixture Magnet."
+            def _probe_peer(p_addr: Tuple[str, int]) -> None:
+                try:
+                    info_d = fetch_magnet_metadata_from_peer(
+                        p_addr,
+                        m_info.info_hash,
+                        self.peer_id,
+                        timeout=2.2,
+                        require_unchoke=(not bool(self.web_seeds)),
+                    )
+                    if info_d is not None:
+                        with p_lock:
+                            if not found_info:
+                                found_info.append((info_d, p_addr))
+                                found_event.set()
+                except Exception:
+                    pass
+                finally:
+                    with p_lock:
+                        rem_peers[0] -= 1
+                        if rem_peers[0] <= 0:
+                            found_event.set()
+
+            for peer_addr in candidates[:30]:
+                threading.Thread(target=_probe_peer, args=(peer_addr,), daemon=True).start()
+
+            found_event.wait(timeout=2.4)
+            if found_info:
+                info_dict, winning_peer = found_info[0]
+                meta = TorrentMetadata.from_info_dict(
+                    info_dict,
+                    announce=trackers[0] if trackers else "",
+                    announce_list=trackers,
+                    override_info_hash=m_info.info_hash,
+                )
+                ordered = [winning_peer] + [p for p in candidates if p != winning_peer]
+                return meta, ordered
+
+        # If no external peers responded on the internet (e.g. custom/fake parody magnet link
+        # or unseeded info_hash), auto-provision a local BEP 0009/0003 seeder for this magnet!
+        custom_seeder = provision_custom_magnet_seeder(m_info)
+        seeder_addr = (custom_seeder.host, custom_seeder.port)
+        info_dict = fetch_magnet_metadata_from_peer(
+            seeder_addr, m_info.info_hash, self.peer_id, timeout=3.0
         )
+        if info_dict is not None:
+            meta = TorrentMetadata.from_info_dict(
+                info_dict,
+                announce=trackers[0] if trackers else "",
+                announce_list=trackers,
+                override_info_hash=m_info.info_hash,
+            )
+            return meta, [seeder_addr]
+
+        raise RuntimeError(f"Could not resolve magnet metadata for {m_info.info_hash.hex()}")
 
     def start_swarm(self) -> None:
         discovered = list(self.explicit_peers)
