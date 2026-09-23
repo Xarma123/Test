@@ -457,10 +457,12 @@ class TorrentVideoToolTests(unittest.TestCase):
         try:
             base_url = ui_server.ui_url.rstrip("/")
 
-            # 1. Verify Web UI HTML loads
+            # 1. Verify Web UI HTML loads with Subtitle Studio and Stream+Disk visibility
             with urllib.request.urlopen(base_url + "/", timeout=5.0) as resp:
                 html = resp.read().decode("utf-8")
                 self.assertIn("BitTorrent Magnet Video Streamer", html)
+                self.assertIn("Precision Subtitle Timing & Sync Studio", html)
+                self.assertIn("Stream + Save Full File in Background", html)
 
             # 2. Start session via POST /api/start with Magnet Link
             req_body = json.dumps({"source": magnet_uri, "mode": "stream"}).encode("utf-8")
@@ -475,6 +477,18 @@ class TorrentVideoToolTests(unittest.TestCase):
                 start_data = json.loads(resp.read().decode("utf-8"))
                 self.assertTrue(start_data["ok"])
                 self.assertEqual(start_data["info_hash"], parsed.info_hash.hex())
+
+            # 2b. Verify POST /api/seek-piece endpoint works for interactive piece-map seeking
+            seek_req = urllib.request.Request(
+                base_url + "/api/seek-piece",
+                data=json.dumps({"piece": 0}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(seek_req, timeout=5.0) as resp:
+                self.assertEqual(resp.status, 200)
+                seek_data = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(seek_data["ok"])
 
             # 3. Stream a byte range from the magnet-resolved video
             range_req = urllib.request.Request(

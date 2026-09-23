@@ -464,15 +464,18 @@ class SparseVideoPieceStore:
             now = time.monotonic()
             urgent_set = set(self._urgent_pieces)
             states = []
+            active_pieces_count = 0
             for p in range(self.first_piece, self.last_piece + 1):
                 if p in self.completed_pieces:
                     states.append("done")
                 elif p in self.in_progress_pieces or p in self._received_blocks:
                     states.append("active")
+                    active_pieces_count += 1
                 elif p in urgent_set:
                     states.append("urgent")
                 else:
                     states.append("pending")
+            in_progress_blocks = sum(len(bset) for bset in self._received_blocks.values())
             # Calculate rolling 3-second speed in B/s
             self._speed_samples = [(t, b) for (t, b) in self._speed_samples if now - t <= 3.0]
             if self._speed_samples:
@@ -484,17 +487,38 @@ class SparseVideoPieceStore:
                 speed_bps = int(self.bytes_downloaded / elapsed) if not self.required_pieces.issubset(self.completed_pieces) else 0
             by_pieces = len(self.completed_pieces & self.required_pieces) / max(1, len(self.required_pieces))
             by_bytes = min(0.9999, self.bytes_downloaded / max(1, self.target_file.length))
-            prog = 1.0 if self.required_pieces.issubset(self.completed_pieces) else round(max(by_pieces, by_bytes), 4)
+            is_comp = self.required_pieces.issubset(self.completed_pieces)
+            prog = 1.0 if is_comp else round(max(by_pieces, by_bytes), 4)
+            rem_bytes = max(0, self.target_file.length - self.bytes_downloaded)
+            eta_seconds = 0 if is_comp else (int(rem_bytes / speed_bps) if speed_bps > 0 else None)
+
+            # Count contiguous completed pieces from current read cursor
+            read_p = getattr(self, "_last_read_piece", self.first_piece)
+            if read_p < self.first_piece:
+                read_p = self.first_piece
+            lookahead_ready_pieces = 0
+            scan = read_p
+            while scan <= self.last_piece and scan in self.completed_pieces:
+                lookahead_ready_pieces += 1
+                scan += 1
+
             return {
                 "total_pieces": len(self.required_pieces),
                 "completed_pieces": len(self.completed_pieces & self.required_pieces),
+                "active_pieces_count": active_pieces_count,
+                "in_progress_blocks": in_progress_blocks,
                 "progress": prog,
-                "complete": self.required_pieces.issubset(self.completed_pieces),
+                "complete": is_comp,
                 "size": self.target_file.length,
                 "bytes_downloaded": self.bytes_downloaded,
                 "speed_bps": speed_bps,
+                "eta_seconds": eta_seconds,
                 "piece_length": self.metadata.piece_length,
                 "priority_cursor": self._priority_cursor,
+                "read_cursor_piece": read_p,
+                "lookahead_ready_pieces": lookahead_ready_pieces,
+                "urgent_window": list(self._urgent_pieces[:6]),
+                "seek_epoch": self._seek_epoch,
                 "pieces": states,
             }
 
@@ -2364,330 +2388,1216 @@ WEB_UI_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BitTorrent Magnet & Video Streamer</title>
+  <title>BitTorrent Magnet Video Streamer & Swarm Workbench</title>
   <style>
     :root {
-      --bg: #0b0f19;
-      --panel: #131b2e;
-      --border: #23304f;
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
+      --bg: #09090b;
+      --surface-1: #111114;
+      --surface-2: #18181c;
+      --surface-3: #202026;
+      --border: #24242c;
+      --border-strong: #32323d;
+      --text: #fafafa;
+      --text-secondary: #a1a1aa;
+      --text-muted: #71717a;
+      --blue: #38bdf8;
+      --blue-strong: #0284c7;
+      --blue-dim: rgba(56, 189, 248, 0.12);
       --emerald: #10b981;
+      --emerald-dim: rgba(16, 185, 129, 0.12);
       --amber: #f59e0b;
-      --text: #f1f5f9;
-      --muted: #94a3b8;
+      --amber-dim: rgba(245, 158, 11, 0.14);
+      --rose: #f43f5e;
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", "Segoe UI", sans-serif;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: radial-gradient(circle at top, #172554 0%, var(--bg) 55%);
+      background: var(--bg);
       color: var(--text);
+      font-family: var(--sans);
+      font-size: 13px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
       min-height: 100vh;
-      padding: 28px 18px;
     }
-    .container {
-      max-width: 1040px;
+
+    /* Top Navigation & Engine Header */
+    .topbar {
+      border-bottom: 1px solid var(--border);
+      background: rgba(17, 17, 20, 0.92);
+      backdrop-filter: blur(12px);
+      position: sticky;
+      top: 0;
+      z-index: 40;
+    }
+    .topbar-inner {
+      max-width: 1400px;
       margin: 0 auto;
-    }
-    header {
+      padding: 12px 24px;
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 16px;
       flex-wrap: wrap;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
       gap: 12px;
-      margin-bottom: 22px;
     }
-    h1 {
-      margin: 0;
-      font-size: 1.55rem;
-      letter-spacing: -0.02em;
-      display: flex;
-      align-items: center;
-      gap: 10px;
+    .brand-mark {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--emerald);
+      box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.18);
     }
-    .badge {
-      font-size: 0.75rem;
-      background: rgba(59, 130, 246, 0.18);
-      color: #93c5fd;
-      border: 1px solid rgba(59, 130, 246, 0.4);
-      padding: 4px 10px;
-      border-radius: 999px;
+    .brand-title {
       font-weight: 600;
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 20px;
-      margin-bottom: 20px;
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    }
-    label {
-      display: block;
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: var(--muted);
-      margin-bottom: 8px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    .input-row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    input[type="text"] {
-      flex: 1;
-      min-width: 260px;
-      background: #090d16;
-      border: 1px solid var(--border);
+      font-size: 14px;
+      letter-spacing: -0.01em;
       color: var(--text);
-      padding: 12px 14px;
-      border-radius: 10px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.88rem;
-      outline: none;
     }
-    input[type="text"]:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+    .brand-sub {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      padding-left: 10px;
+      border-left: 1px solid var(--border);
     }
-    .btn-row {
-      display: flex;
-      gap: 10px;
-      margin-top: 14px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-    button, .btn-link {
-      cursor: pointer;
-      border: none;
-      border-radius: 10px;
-      padding: 11px 18px;
-      font-size: 0.92rem;
-      font-weight: 600;
+    .engine-mode-pill {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      transition: all 0.15s ease;
-      text-decoration: none;
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 5px 11px;
+      border-radius: 6px;
+      border: 1px solid var(--border-strong);
+      background: var(--surface-2);
+      color: var(--text-secondary);
     }
-    .btn-stream {
-      background: var(--accent);
-      color: white;
+    .engine-mode-pill.streaming {
+      border-color: rgba(16, 185, 129, 0.45);
+      background: rgba(16, 185, 129, 0.1);
+      color: #6ee7b7;
     }
-    .btn-stream:hover { background: var(--accent-hover); }
-    .btn-download {
-      background: var(--emerald);
-      color: #052e16;
+
+    .workspace {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px 24px 48px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
     }
-    .btn-download:hover { filter: brightness(1.1); }
-    .btn-fixture {
-      background: #1e293b;
-      color: #cbd5e1;
-      border: 1px solid #334155;
-      font-size: 0.82rem;
-      padding: 8px 13px;
-    }
-    .btn-fixture:hover { background: #334155; color: white; }
-    .grid-2 {
-      display: grid;
-      grid-template-columns: 1.35fr 1fr;
-      gap: 20px;
-    }
-    @media (max-width: 820px) {
-      .grid-2 { grid-template-columns: 1fr; }
-    }
-    video {
-      width: 100%;
-      border-radius: 10px;
-      background: #000;
+
+    /* Surface Panels */
+    .panel {
+      background: var(--surface-1);
       border: 1px solid var(--border);
-      aspect-ratio: 16 / 9;
+      border-radius: 8px;
+      overflow: hidden;
     }
-    .stats-grid {
+    .panel-header {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: var(--surface-2);
+    }
+    .panel-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .panel-body {
+      padding: 16px;
+    }
+
+    /* Command Input Bar */
+    .source-bar {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 10px;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: stretch;
+    }
+    @media (max-width: 960px) {
+      .source-bar { grid-template-columns: 1fr; }
+    }
+    .input-wrap {
+      display: flex;
+      align-items: center;
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 0 12px;
+      transition: border-color 0.15s ease;
+    }
+    .input-wrap:focus-within {
+      border-color: var(--blue);
+    }
+    .input-prefix {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-right: 10px;
+      user-select: none;
+    }
+    .input-wrap input {
+      width: 100%;
+      background: transparent;
+      border: none;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12.5px;
+      padding: 10px 0;
+      outline: none;
+    }
+    .action-group {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      cursor: pointer;
+      border: 1px solid var(--border-strong);
+      background: var(--surface-2);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 12.5px;
+      font-weight: 500;
+      padding: 8px 14px;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.12s ease;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .btn:hover {
+      background: var(--surface-3);
+      border-color: #454554;
+    }
+    .btn-primary {
+      background: var(--text);
+      color: #09090b;
+      border-color: var(--text);
+      font-weight: 600;
+    }
+    .btn-primary:hover {
+      background: #e4e4e7;
+      border-color: #e4e4e7;
+    }
+    .btn-emerald {
+      background: rgba(16, 185, 129, 0.14);
+      color: #34d399;
+      border-color: rgba(16, 185, 129, 0.35);
+    }
+    .btn-emerald:hover {
+      background: rgba(16, 185, 129, 0.22);
+    }
+    .btn-sm {
+      padding: 5px 10px;
+      font-size: 11.5px;
+      border-radius: 5px;
+    }
+    .btn-mono {
+      font-family: var(--mono);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Presets Row & Mode Explanation */
+    .presets-strip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    .preset-pills {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .preset-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: var(--mono);
+      margin-right: 4px;
+    }
+    .mode-explainer {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      background: var(--surface-2);
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+    .mode-explainer strong {
+      color: var(--emerald);
+      font-weight: 600;
+    }
+
+    /* 4-Stage Pipeline Architecture Strip (Explains Stream + Background Save!) */
+    .pipeline-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    @media (max-width: 1024px) {
+      .pipeline-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 600px) {
+      .pipeline-grid { grid-template-columns: 1fr; }
+    }
+    .pipeline-step {
+      background: var(--surface-1);
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      position: relative;
+    }
+    .pipeline-step.active-stage {
+      background: linear-gradient(180deg, rgba(56, 189, 248, 0.05) 0%, var(--surface-1) 100%);
+    }
+    .pipeline-step.disk-stage {
+      background: linear-gradient(180deg, rgba(16, 185, 129, 0.06) 0%, var(--surface-1) 100%);
+    }
+    .step-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .step-badge {
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      background: var(--surface-3);
+      color: var(--text-secondary);
+    }
+    .step-badge.live {
+      background: var(--emerald-dim);
+      color: var(--emerald);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .step-badge.stream {
+      background: var(--blue-dim);
+      color: var(--blue);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+    }
+    .step-main {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--text);
+      font-family: var(--mono);
+      font-variant-numeric: tabular-nums;
+      margin-top: 2px;
+    }
+    .step-desc {
+      font-size: 11.5px;
+      color: var(--text-secondary);
+    }
+
+    /* Main Theatre & Subtitle Grid */
+    .stage-layout {
+      display: grid;
+      grid-template-columns: 1.55fr 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 1100px) {
+      .stage-layout { grid-template-columns: 1fr; }
+    }
+
+    /* Cinema Video Stage + Custom Subtitle Overlay */
+    .player-stage {
+      position: relative;
+      width: 100%;
+      background: #000;
+      aspect-ratio: 16 / 9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .player-stage:fullscreen {
+      width: 100vw;
+      height: 100vh;
+    }
+    .player-stage video {
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #000;
+    }
+    .subtitle-overlay {
+      position: absolute;
+      left: 6%;
+      right: 6%;
+      bottom: 11%;
+      pointer-events: none;
+      text-align: center;
+      z-index: 25;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-end;
+      transition: bottom 0.1s ease;
+    }
+    .subtitle-line {
+      display: inline-block;
+      max-width: 90%;
+      padding: 5px 14px;
+      border-radius: 6px;
+      background: rgba(9, 9, 11, 0.82);
+      backdrop-filter: blur(4px);
+      color: #ffffff;
+      font-family: var(--sans);
+      font-size: 21px;
+      font-weight: 600;
+      line-height: 1.38;
+      letter-spacing: 0.01em;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      white-space: pre-line;
+    }
+    .subtitle-line:empty {
+      display: none;
+    }
+    .stage-FloatingBar {
+      padding: 10px 16px;
+      background: var(--surface-2);
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    /* Precision Subtitle Studio */
+    .sub-controls-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .sub-offset-box {
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .offset-readout {
+      font-family: var(--mono);
+      font-size: 15px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--blue);
+      min-width: 125px;
+      text-align: center;
+    }
+    .offset-input {
+      width: 78px;
+      background: var(--surface-2);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 4px 7px;
+      border-radius: 4px;
+      text-align: right;
+    }
+    .cue-list {
+      max-height: 195px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+    }
+    .cue-item {
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--border);
+      display: grid;
+      grid-template-columns: 120px 1fr auto;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+      transition: background 0.1s ease;
+    }
+    .cue-item:last-child { border-bottom: none; }
+    .cue-item:hover { background: var(--surface-2); }
+    .cue-item.active-cue {
+      background: rgba(56, 189, 248, 0.12);
+      border-left: 3px solid var(--blue);
+    }
+    .cue-time {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .cue-text {
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Dual Progress & Piece Matrix */
+    .dual-progress-card {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
       margin-bottom: 14px;
     }
-    .stat-box {
-      background: #090d16;
+    .progress-block {
+      background: var(--bg);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: 6px;
       padding: 10px 12px;
     }
-    .stat-label {
-      font-size: 0.74rem;
-      color: var(--muted);
-      text-transform: uppercase;
+    .progress-row-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      font-size: 11.5px;
     }
-    .stat-value {
-      font-size: 1.05rem;
-      font-weight: 700;
-      margin-top: 3px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      word-break: break-all;
-    }
-    .progress-bar-bg {
-      height: 10px;
-      background: #090d16;
+    .progress-bar-track {
+      height: 7px;
+      background: var(--surface-3);
       border-radius: 999px;
       overflow: hidden;
-      border: 1px solid var(--border);
-      margin: 12px 0;
+      display: flex;
     }
-    .progress-bar-fill {
+    .progress-fill-disk {
       height: 100%;
       width: 0%;
-      background: linear-gradient(90deg, var(--accent), var(--emerald));
-      transition: width 0.25s ease;
+      background: var(--emerald);
+      transition: width 0.2s ease;
     }
+    .progress-fill-buffer {
+      height: 100%;
+      width: 0%;
+      background: var(--blue);
+      transition: width 0.2s ease;
+    }
+
+    .telemetry-kv-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .kv-cell {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+    .kv-label {
+      font-size: 10.5px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .kv-val {
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      margin-top: 2px;
+      font-variant-numeric: tabular-nums;
+      word-break: break-all;
+    }
+
+    /* Piece Matrix */
     .piece-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(14px, 1fr));
-      gap: 4px;
-      margin-top: 10px;
-      max-height: 170px;
+      grid-template-columns: repeat(auto-fill, minmax(11px, 1fr));
+      gap: 3px;
+      max-height: 220px;
       overflow-y: auto;
-      padding: 8px;
-      background: #090d16;
-      border-radius: 8px;
+      padding: 10px;
+      background: var(--bg);
       border: 1px solid var(--border);
+      border-radius: 6px;
     }
     .piece-cell {
-      height: 14px;
-      border-radius: 3px;
-      background: #1e293b;
-      transition: background 0.15s;
+      height: 11px;
+      border-radius: 2px;
+      background: #1f1f27;
+      cursor: pointer;
+      transition: transform 0.08s ease, background 0.15s ease;
+    }
+    .piece-cell:hover {
+      transform: scale(1.35);
+      z-index: 5;
+      outline: 1px solid var(--text);
     }
     .piece-cell.done { background: var(--emerald); }
+    .piece-cell.active { background: var(--blue); box-shadow: 0 0 6px rgba(56, 189, 248, 0.7); }
     .piece-cell.urgent { background: var(--amber); }
-    .piece-cell.active { background: var(--accent); }
-    .legend {
+
+    .legend-row {
       display: flex;
       gap: 14px;
-      font-size: 0.78rem;
-      color: var(--muted);
-      margin-top: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
     }
     .dot {
-      display: inline-block;
       width: 9px;
       height: 9px;
       border-radius: 2px;
-      margin-right: 5px;
     }
-    .status-banner {
-      margin-top: 12px;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 0.88rem;
-      background: rgba(16, 185, 129, 0.12);
-      border: 1px solid rgba(16, 185, 129, 0.35);
-      color: #a7f3d0;
+    .status-toast {
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      border: 1px solid var(--border-strong);
+      background: var(--surface-2);
+      color: var(--text-secondary);
       display: none;
+      margin-top: 10px;
     }
-    .error-banner {
-      margin-top: 12px;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 0.88rem;
-      background: rgba(239, 68, 68, 0.15);
-      border: 1px solid rgba(239, 68, 68, 0.4);
-      color: #fecaca;
-      display: none;
+    .status-toast.error {
+      border-color: rgba(244, 63, 94, 0.45);
+      background: rgba(244, 63, 94, 0.1);
+      color: #fda4af;
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <h1>⚡ BitTorrent Magnet Video Streamer & Downloader</h1>
-      <span class="badge">BEP 0003 + BEP 0009 Magnet + BEP 0019 + HTTP 206 Range</span>
-    </header>
-
-    <div class="card">
-      <label for="magnetInput">Paste Any Magnet Link (<code>magnet:?xt=urn:btih:...</code>) or Local <code>.torrent</code> Path</label>
-      <div class="input-row">
-        <input
-          id="magnetInput"
-          type="text"
-          placeholder="magnet:?xt=urn:btih:... or path/to/video.torrent"
-        />
-        <input id="torrentFileInput" type="file" accept=".torrent" style="display:none" onchange="uploadTorrentFile(this)" />
-        <button class="btn-fixture" onclick="document.getElementById('torrentFileInput').click()">📂 Upload .torrent</button>
+  <!-- Top Bar -->
+  <nav class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" id="enginePulse"></span>
+        <span class="brand-title">BitTorrent Media Stream & Swarm Workbench</span>
+        <span class="brand-sub">BEP-03 / BEP-09 / BEP-11 PEX / HTTP 206 Sub-Piece Engine</span>
       </div>
-      <div class="btn-row">
-        <button class="btn-stream" onclick="startSession('stream')">▶ Stream Video Now</button>
-        <button class="btn-download" onclick="startSession('download')">⬇ Download Video</button>
-        <button class="btn-fixture" onclick="loadFixtureMagnet('fixture')">🧪 Local H.264 Fixture (1 MB)</button>
-        <button class="btn-fixture" onclick="loadFixtureMagnet('sintel')">🎬 Sintel Online Magnet (129 MB)</button>
-        <button class="btn-fixture" onclick="loadFixtureMagnet('big_buck_bunny')">🐰 Big Buck Bunny (263 MB)</button>
-        <button class="btn-fixture" onclick="loadFixtureMagnet('odyssey')">🏛️ The Odyssey 2026 (5.56 GiB MKV)</button>
-        <a id="saveDiskLink" class="btn-link btn-fixture" style="display:none;" href="/download" download>💾 Save File to Browser</a>
-      </div>
-      <div id="statusBanner" class="status-banner"></div>
-      <div id="errorBanner" class="error-banner"></div>
-    </div>
-
-    <div class="grid-2">
-      <div class="card">
-        <label>Live HTTP 206 Range Video Player (Supports Arbitrary Seeking)</label>
-        <video id="videoPlayer" controls playsinline></video>
-      </div>
-
-      <div class="card">
-        <label>Swarm & Piece Scheduler Telemetry</label>
-        <div class="stats-grid">
-          <div class="stat-box">
-            <div class="stat-label">Target Video</div>
-            <div id="statName" class="stat-value">—</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Video Size</div>
-            <div id="statSize" class="stat-value">—</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Info Hash (BTIH)</div>
-            <div id="statHash" class="stat-value" style="font-size:0.78rem;">—</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Download Progress</div>
-            <div id="statProgress" class="stat-value">0%</div>
-          </div>
-        </div>
-
-        <div class="progress-bar-bg">
-          <div id="progressBar" class="progress-bar-fill"></div>
-        </div>
-
-        <label style="margin-top:14px;">Sparse Piece Map (Real-time SHA-1 Verified Pieces)</label>
-        <div id="pieceGrid" class="piece-grid"></div>
-        <div class="legend">
-          <span><i class="dot" style="background:#10b981;"></i>Verified (SHA-1)</span>
-          <span><i class="dot" style="background:#3b82f6;"></i>In-Flight</span>
-          <span><i class="dot" style="background:#f59e0b;"></i>Seek Priority Window</span>
-          <span><i class="dot" style="background:#1e293b;"></i>Sparse / Pending</span>
-        </div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span class="engine-mode-pill" id="engineModePill">ENGINE IDLE • READY</span>
+        <a id="saveDiskLink" href="/download" download class="btn btn-emerald btn-sm" style="display:none;">
+          ↓ Export Saved Video From Disk (<span id="exportPctLabel">0%</span>)
+        </a>
       </div>
     </div>
-  </div>
+  </nav>
+
+  <main class="workspace">
+    <!-- 1. Source Input & Mode Control Panel -->
+    <section class="panel">
+      <div class="panel-body">
+        <div class="source-bar">
+          <div class="input-wrap">
+            <span class="input-prefix">SOURCE URI</span>
+            <input type="text" id="magnetInput" placeholder="Paste magnet:?xt=urn:btih:... or local .torrent file path" />
+          </div>
+          <div class="action-group">
+            <button class="btn btn-primary" onclick="startSession('stream')" title="Starts instant HTTP 206 playback AND simultaneously downloads + SHA-1 verifies the full video file to ./downloads in the background">
+              ▶ Stream + Save Full File in Background
+            </button>
+            <button class="btn" onclick="startSession('download')" title="Downloads & SHA-1 verifies the complete file to ./downloads without opening the video player">
+              ↓ Download Only (To Disk)
+            </button>
+            <label class="btn" style="margin:0; cursor:pointer;">
+              Upload .torrent
+              <input type="file" id="torrentFileInput" accept=".torrent" style="display:none" onchange="uploadTorrentFile(this)" />
+            </label>
+          </div>
+        </div>
+
+        <div class="presets-strip">
+          <div class="preset-pills">
+            <span class="preset-label">SWARM PRESETS:</span>
+            <button class="btn btn-sm" onclick="loadPreset('odyssey')">The Odyssey 2026 (5.56 GiB HEVC MKV)</button>
+            <button class="btn btn-sm" onclick="loadPreset('sintel')">Sintel (129 MB MP4)</button>
+            <button class="btn btn-sm" onclick="loadPreset('big_buck_bunny')">Big Buck Bunny (263 MB MP4)</button>
+            <button class="btn btn-sm" onclick="loadPreset('tears_of_steel')">Tears of Steel (545 MB MP4)</button>
+            <button class="btn btn-sm" onclick="loadPreset('fixture')">Local H.264 Fixture (1 MB)</button>
+          </div>
+          <div class="mode-explainer">
+            <span><strong>How Streaming Works:</strong> Clicking <em>Stream + Save</em> prioritizes a <strong>48 MiB lookahead window</strong> for zero-wait playback while <strong>continuously downloading & saving 100% of the video to <code>./downloads/</code></strong> in the background.</span>
+          </div>
+        </div>
+
+        <div id="statusBanner" class="status-toast"></div>
+        <div id="errorBanner" class="status-toast error"></div>
+      </div>
+    </section>
+
+    <!-- 2. 4-Stage Real-Time Pipeline Architecture Strip -->
+    <section class="pipeline-grid">
+      <div class="pipeline-step active-stage">
+        <div class="step-top">
+          <span>1. Swarm Discovery (DHT / PEX)</span>
+          <span class="step-badge stream" id="pipeSwarmBadge">STANDBY</span>
+        </div>
+        <div class="step-main" id="pipePeersVal">0 Active / 0 Swarm Peers</div>
+        <div class="step-desc" id="pipeTrackersDesc">Concurrent UDP BEP-15 + HTTP Trackers + BEP-11 PEX</div>
+      </div>
+
+      <div class="pipeline-step active-stage">
+        <div class="step-top">
+          <span>2. Urgent Lookahead Window</span>
+          <span class="step-badge stream" id="pipeBufferBadge">48 MiB WINDOW</span>
+        </div>
+        <div class="step-main" id="pipeUrgentVal">Cursor Piece #0</div>
+        <div class="step-desc" id="pipeBlocksDesc">0.45s seek-head block racing • 16 KiB sub-piece striping</div>
+      </div>
+
+      <div class="pipeline-step active-stage">
+        <div class="step-top">
+          <span>3. HTTP 206 Range Streamer</span>
+          <span class="step-badge stream" id="pipeStreamBadge">READY</span>
+        </div>
+        <div class="step-main" id="pipeThroughputVal">0.00 MiB/s</div>
+        <div class="step-desc" id="pipeStreamDesc">Direct sparse pread/pwrite • Instant MSG_CANCEL seek</div>
+      </div>
+
+      <div class="pipeline-step disk-stage">
+        <div class="step-top">
+          <span>4. Background Disk Persistence</span>
+          <span class="step-badge live" id="pipeDiskBadge">IDLE</span>
+        </div>
+        <div class="step-main" id="pipeDiskVal">0 B / 0 B Saved</div>
+        <div class="step-desc" id="pipeDiskPath">Writing & SHA-1 verifying full file to ./downloads/</div>
+      </div>
+    </section>
+
+    <!-- 3. Main Workspace: Left = Cinema Stage + Subtitle Studio | Right = Disk & Swarm Telemetry + Piece Map -->
+    <div class="stage-layout">
+      <!-- Left Column: Video Player Stage + Precision Subtitle Studio -->
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        <section class="panel">
+          <div class="panel-header">
+            <div class="panel-title">
+              <span>Cinema HTTP 206 Partial Content Stage</span>
+              <span style="font-family:var(--mono); font-size:11px; color:var(--text-muted);" id="playerFileBadge">No active media</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <button class="btn btn-sm" onclick="toggleSubtitleVisibility()" id="subToggleBtn">CC: ON</button>
+              <button class="btn btn-sm" onclick="cycleSubtitleSize()" id="subSizeBtn">Font: M</button>
+              <button class="btn btn-sm" onclick="toggleStageFullscreen()">⛶ Fullscreen Stage</button>
+            </div>
+          </div>
+
+          <div class="player-stage" id="playerStage">
+            <video id="videoPlayer" controls preload="metadata" crossorigin="anonymous"></video>
+            <div class="subtitle-overlay" id="subtitleOverlay">
+              <div class="subtitle-line" id="subtitleLine"></div>
+            </div>
+          </div>
+
+          <div class="stage-FloatingBar">
+            <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+              <span style="font-family:var(--mono); font-size:11px; color:var(--text-secondary);">
+                PLAYBACK TIME: <strong id="playerTimeReadout" style="color:var(--text);">00:00:00.000</strong>
+              </span>
+              <span style="color:var(--border-strong);">|</span>
+              <span style="font-family:var(--mono); font-size:11px; color:var(--text-secondary);">
+                SUBTITLE TRACK: <strong id="subTrackName" style="color:var(--blue);">None Loaded (.SRT / .VTT / .ASS)</strong>
+              </span>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <label class="btn btn-sm btn-emerald" style="margin:0; cursor:pointer;">
+                + Load Subtitle (.srt / .vtt / .ass)
+                <input type="file" id="subtitleFileInput" accept=".srt,.vtt,.ass,.ssa,.sub,.txt" style="display:none" onchange="handleSubtitleUpload(this)" />
+              </label>
+              <button class="btn btn-sm" onclick="loadDemoSubtitles()" title="Load sample time-coded subtitles to test millisecond sync adjustment">
+                Load Test Subtitles
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Precision Subtitle Synchronization Studio -->
+        <section class="panel">
+          <div class="panel-header">
+            <div class="panel-title">
+              <span>Precision Subtitle Timing & Sync Studio</span>
+              <span style="font-family:var(--mono); font-size:10.5px; color:var(--text-muted);">Shortcuts: [ or G (-50ms) • ] or H (+50ms)</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <button class="btn btn-sm" onclick="exportShiftedSrt()" id="exportSubBtn" style="display:none;">
+                ↓ Download Shifted .SRT
+              </button>
+              <button class="btn btn-sm" onclick="clearSubtitles()" id="clearSubBtn" style="display:none;">
+                Clear
+              </button>
+            </div>
+          </div>
+          <div class="panel-body sub-controls-grid">
+            <div class="sub-offset-box">
+              <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
+                <span style="font-size:11px; font-family:var(--mono); color:var(--text-muted); margin-right:4px;">EARLIER:</span>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(-5.0)">-5.0s</button>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(-1.0)">-1.0s</button>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(-0.25)">-250ms</button>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(-0.05)">-50ms</button>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(-0.01)">-10ms</button>
+              </div>
+
+              <div style="display:flex; align-items:center; gap:8px;">
+                <div class="offset-readout" id="subOffsetReadout">+0.000s (0 ms)</div>
+                <input type="number" id="subOffsetInput" class="offset-input" step="0.01" value="0.00" title="Enter exact subtitle offset in seconds (e.g. -1.45 or +2.10)" onchange="setSubtitleOffsetSeconds(parseFloat(this.value || 0))" />
+                <button class="btn btn-sm" onclick="setSubtitleOffsetSeconds(0)">Reset 0ms</button>
+              </div>
+
+              <div style="display:flex; align-items:center; gap:5px; flex-wrap:wrap;">
+                <span style="font-size:11px; font-family:var(--mono); color:var(--text-muted); margin-right:4px;">LATER:</span>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(0.01)">+10ms</button>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(0.05)">+50ms</button>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(0.25)">+250ms</button>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(1.0)">+1.0s</button>
+                <button class="btn btn-sm btn-mono" onclick="nudgeSubtitleOffset(5.0)">+5.0s</button>
+              </div>
+            </div>
+
+            <div style="display:flex; align-items:center; justify-content:space-between; font-size:11.5px; color:var(--text-secondary);">
+              <span><strong>Interactive Cue Timeline:</strong> Click <em>"Snap to Video Now"</em> on any dialogue line below when you hear the actor speak it to auto-calibrate the exact offset.</span>
+              <span style="font-family:var(--mono); font-size:11px; color:var(--text-muted);" id="subCueCountLabel">0 cues loaded</span>
+            </div>
+
+            <div class="cue-list" id="subCueList">
+              <div style="padding:20px; text-align:center; color:var(--text-muted); font-size:12px;">
+                Load any <code>.srt</code>, <code>.vtt</code>, or <code>.ass</code> subtitle file above (or click <em>Load Test Subtitles</em>) to inspect dialogue cues and adjust forward/backward timing with 10ms precision.
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Right Column: Simultaneous Stream + Disk Persistence Telemetry & Interactive Piece Map -->
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        <section class="panel">
+          <div class="panel-header">
+            <div class="panel-title">
+              <span>Stream Lookahead & Background Disk Persistence</span>
+            </div>
+            <span style="font-family:var(--mono); font-size:11px; color:var(--emerald);" id="diskPersistenceStateBadge">STANDBY</span>
+          </div>
+          <div class="panel-body">
+            <!-- Dual Progress Bars clearly separating Stream Buffer vs Background Disk Save -->
+            <div class="dual-progress-card">
+              <div class="progress-block">
+                <div class="progress-row-top">
+                  <span style="font-weight:600; color:var(--emerald);">1. Full Video Background Download to Disk (<code>./downloads</code>)</span>
+                  <span style="font-family:var(--mono); font-weight:600; color:var(--text);" id="statProgress">0% (0/0 pieces)</span>
+                </div>
+                <div class="progress-bar-track">
+                  <div class="progress-fill-disk" id="progressBar"></div>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-top:6px; font-size:11px; color:var(--text-secondary); font-family:var(--mono);">
+                  <span id="diskWrittenLabel">0 B written to sparse file</span>
+                  <span id="diskEtaLabel">ETA: —</span>
+                </div>
+              </div>
+
+              <div class="progress-block">
+                <div class="progress-row-top">
+                  <span style="font-weight:600; color:var(--blue);">2. Urgent Playback Lookahead Buffer (48 MiB Window Ahead of Seek Head)</span>
+                  <span style="font-family:var(--mono); font-weight:600; color:var(--blue);" id="lookaheadBufferLabel">Waiting for stream...</span>
+                </div>
+                <div class="progress-bar-track">
+                  <div class="progress-fill-buffer" id="lookaheadBar" style="width:0%"></div>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-top:6px; font-size:11px; color:var(--text-secondary); font-family:var(--mono);">
+                  <span id="urgentWindowPiecesLabel">Urgent Pieces: —</span>
+                  <span id="subPieceBlocksLabel">0 sub-piece blocks (16 KiB) in-flight</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Structured Engineering KV Telemetry -->
+            <div class="telemetry-kv-grid">
+              <div class="kv-cell">
+                <div class="kv-label">Target Video File</div>
+                <div class="kv-val" id="statName">—</div>
+              </div>
+              <div class="kv-cell">
+                <div class="kv-label">Container Size & Piece Size</div>
+                <div class="kv-val" id="statSize">—</div>
+              </div>
+              <div class="kv-cell">
+                <div class="kv-label">Live Swarm Speed</div>
+                <div class="kv-val" id="statSpeed" style="color:var(--emerald);">0.00 MiB/s</div>
+              </div>
+              <div class="kv-cell">
+                <div class="kv-label">Connected Peers / Swarm</div>
+                <div class="kv-val" id="statPeers">0 connected / 0 discovered</div>
+              </div>
+              <div class="kv-cell">
+                <div class="kv-label">Disk Output Path</div>
+                <div class="kv-val" id="statDiskPath" style="font-size:11.5px; color:var(--text-secondary);">./downloads/</div>
+              </div>
+              <div class="kv-cell">
+                <div class="kv-label">BTIH InfoHash (SHA-1)</div>
+                <div class="kv-val" id="statHash" style="font-size:11.5px; color:var(--text-secondary);">—</div>
+              </div>
+            </div>
+
+            <!-- Interactive Sparse Piece Map -->
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+              <span style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-secondary);">
+                Interactive Sparse Piece Map (Click any piece to seek)
+              </span>
+              <span style="font-family:var(--mono); font-size:11px; color:var(--text-muted);" id="pieceHoverInfo">
+                Hover or click a piece cell
+              </span>
+            </div>
+
+            <div id="pieceGrid" class="piece-grid"></div>
+
+            <div class="legend-row">
+              <span class="legend-item"><span class="dot" style="background:var(--emerald)"></span>SHA-1 Verified on Disk</span>
+              <span class="legend-item"><span class="dot" style="background:var(--blue)"></span>Receiving 16 KiB Sub-Piece Blocks</span>
+              <span class="legend-item"><span class="dot" style="background:var(--amber)"></span>48 MiB Urgent Stream Lookahead</span>
+              <span class="legend-item"><span class="dot" style="background:#1f1f27"></span>Queued for Background Download</span>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
 
   <script>
     let pollTimer = null;
+    let currentSessionSize = 0;
+    let currentPieceLength = 0;
+    let currentTotalPieces = 0;
 
-    async function loadFixtureMagnet(preset = 'fixture') {
-      const res = await fetch('/api/fixture-magnet?preset=' + encodeURIComponent(preset));
-      const data = await res.json();
-      document.getElementById('magnetInput').value = data.magnet;
-      showStatus('Loaded ' + (data.label || preset) + ' Magnet Link. Click "▶ Stream Video Now" or "⬇ Download Video"!');
+    // =========================================================================
+    // Precision Subtitle Engine (.SRT, .VTT, .ASS/.SSA + Millisecond Offset Sync)
+    // =========================================================================
+    let subtitleCues = [];       // [{ index, start, end, text }]
+    let subtitleOffsetSec = 0.0; // Positive = subtitles appear LATER, Negative = EARLIER
+    let subtitlesEnabled = true;
+    let subtitleFontSizes = [17, 21, 26, 32];
+    let subtitleFontSizeLabels = ['S', 'M', 'L', 'XL'];
+    let subtitleFontIdx = 1;
+    let lastActiveCueIdx = -2;
+
+    function formatTimestamp(sec) {
+      if (!isFinite(sec) || sec < 0) sec = 0;
+      const hrs = Math.floor(sec / 3600);
+      const mins = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      const ms = Math.round((sec - Math.floor(sec)) * 1000);
+      return String(hrs).padStart(2, '0') + ':' +
+             String(mins).padStart(2, '0') + ':' +
+             String(s).padStart(2, '0') + '.' +
+             String(ms).padStart(3, '0');
     }
 
-    async function uploadTorrentFile(input) {
-      if (!input.files || !input.files[0]) return;
-      const file = input.files[0];
+    function parseTimecodeToSeconds(tc) {
+      if (!tc) return 0;
+      const clean = tc.trim().replace(',', '.');
+      const parts = clean.split(':');
+      if (parts.length === 3) {
+        return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+      } else if (parts.length === 2) {
+        return parseFloat(parts[0]) * 60 + parseFloat(parts[1]);
+      }
+      return parseFloat(clean) || 0;
+    }
+
+    function parseSubtitleText(rawText, filename) {
+      const cues = [];
+      const ext = (filename || '').toLowerCase();
+      const normalized = rawText.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
+
+      if (ext.endsWith('.ass') || ext.endsWith('.ssa') || normalized.includes('[Events]')) {
+        const lines = normalized.split('\\n');
+        for (const line of lines) {
+          if (line.startsWith('Dialogue:')) {
+            const rest = line.slice('Dialogue:'.length).trim();
+            const cols = rest.split(',');
+            if (cols.length >= 10) {
+              const start = parseTimecodeToSeconds(cols[1]);
+              const end = parseTimecodeToSeconds(cols[2]);
+              const rawDlg = cols.slice(9).join(',')
+                .replace(/\\{[^}]*\\}/g, '')
+                .replace(/\\\\N/g, '\\n')
+                .replace(/\\\\n/g, '\\n')
+                .trim();
+              if (rawDlg && end > start) {
+                cues.push({ index: cues.length + 1, start, end, text: rawDlg });
+              }
+            }
+          }
+        }
+      } else {
+        const blocks = normalized.split(/\\n\\s*\\n/);
+        for (const block of blocks) {
+          const lines = block.trim().split('\\n');
+          if (!lines.length) continue;
+          let tcLineIdx = -1;
+          for (let i = 0; i < Math.min(3, lines.length); i++) {
+            if (lines[i].includes('-->')) {
+              tcLineIdx = i;
+              break;
+            }
+          }
+          if (tcLineIdx === -1) continue;
+          const tcParts = lines[tcLineIdx].split('-->');
+          const start = parseTimecodeToSeconds(tcParts[0]);
+          const end = parseTimecodeToSeconds(tcParts[1].trim().split(/\\s+/)[0]);
+          const text = lines.slice(tcLineIdx + 1)
+            .join('\\n')
+            .replace(/<[^>]+>/g, '')
+            .trim();
+          if (text && end >= start) {
+            cues.push({ index: cues.length + 1, start, end, text });
+          }
+        }
+      }
+      cues.sort((a, b) => a.start - b.start);
+      return cues;
+    }
+
+    function handleSubtitleUpload(inputEl) {
+      if (!inputEl.files || !inputEl.files.length) return;
+      const file = inputEl.files[0];
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const parsed = parseSubtitleText(e.target.result || '', file.name);
+        subtitleCues = parsed;
+        lastActiveCueIdx = -2;
+        document.getElementById('subTrackName').textContent = file.name + ' (' + parsed.length + ' cues)';
+        document.getElementById('subCueCountLabel').textContent = parsed.length + ' cues loaded';
+        document.getElementById('exportSubBtn').style.display = parsed.length ? 'inline-flex' : 'none';
+        document.getElementById('clearSubBtn').style.display = parsed.length ? 'inline-flex' : 'none';
+        renderSubtitleCueList(-1);
+        updateSubtitleOverlay();
+        showStatus('Loaded subtitle "' + file.name + '" (' + parsed.length + ' cues). Use ±10ms / ±50ms / ±250ms buttons or [ / ] keys to fine-tune sync.');
+      };
+      reader.readAsText(file);
+    }
+
+    function loadDemoSubtitles() {
+      const video = document.getElementById('videoPlayer');
+      const base = Math.floor(video.currentTime || 0);
+      const sampleSrt = [
+        "1\\n" + formatTimestamp(base + 0.2).replace('.', ',') + " --> " + formatTimestamp(base + 3.5).replace('.', ',') + "\\n[Subtitle Engine Active] Synchronized to 10ms precision.",
+        "2\\n" + formatTimestamp(base + 3.8).replace('.', ',') + " --> " + formatTimestamp(base + 7.5).replace('.', ',') + "\\nUse -50ms / +50ms buttons or press [ and ] keys to shift subtitles forward or backward.",
+        "3\\n" + formatTimestamp(base + 7.8).replace('.', ',') + " --> " + formatTimestamp(base + 12.0).replace('.', ',') + "\\nOr click 'Snap to Video Now' on any dialogue row below when you hear the line spoken!",
+        "4\\n" + formatTimestamp(base + 12.5).replace('.', ',') + " --> " + formatTimestamp(base + 17.0).replace('.', ',') + "\\nStreaming HTTP 206 Partial Content while simultaneously saving the full video to ./downloads."
+      ].join("\\n\\n");
+      subtitleCues = parseSubtitleText(sampleSrt, 'sample_sync_test.srt');
+      lastActiveCueIdx = -2;
+      document.getElementById('subTrackName').textContent = 'sample_sync_test.srt (' + subtitleCues.length + ' cues)';
+      document.getElementById('subCueCountLabel').textContent = subtitleCues.length + ' cues loaded';
+      document.getElementById('exportSubBtn').style.display = 'inline-flex';
+      document.getElementById('clearSubBtn').style.display = 'inline-flex';
+      renderSubtitleCueList(-1);
+      updateSubtitleOverlay();
+    }
+
+    function clearSubtitles() {
+      subtitleCues = [];
+      subtitleOffsetSec = 0.0;
+      document.getElementById('subTrackName').textContent = 'None Loaded (.SRT / .VTT / .ASS)';
+      document.getElementById('subCueCountLabel').textContent = '0 cues loaded';
+      document.getElementById('exportSubBtn').style.display = 'none';
+      document.getElementById('clearSubBtn').style.display = 'none';
+      document.getElementById('subtitleLine').textContent = '';
+      setSubtitleOffsetSeconds(0);
+      renderSubtitleCueList(-1);
+    }
+
+    function setSubtitleOffsetSeconds(val) {
+      if (!isFinite(val)) val = 0;
+      subtitleOffsetSec = Math.round(val * 1000) / 1000;
+      const ms = Math.round(subtitleOffsetSec * 1000);
+      const sign = subtitleOffsetSec >= 0 ? '+' : '';
+      document.getElementById('subOffsetReadout').textContent =
+        sign + subtitleOffsetSec.toFixed(3) + 's (' + (ms >= 0 ? '+' : '') + ms + ' ms)';
+      document.getElementById('subOffsetInput').value = subtitleOffsetSec.toFixed(2);
+      lastActiveCueIdx = -2;
+      updateSubtitleOverlay();
+    }
+
+    function nudgeSubtitleOffset(deltaSec) {
+      setSubtitleOffsetSeconds(subtitleOffsetSec + deltaSec);
+    }
+
+    function snapCueToCurrentVideoTime(cueIdx) {
+      if (cueIdx < 0 || cueIdx >= subtitleCues.length) return;
+      const video = document.getElementById('videoPlayer');
+      const nowTime = video.currentTime || 0;
+      const targetCue = subtitleCues[cueIdx];
+      const newOffset = nowTime - targetCue.start;
+      setSubtitleOffsetSeconds(newOffset);
+      showStatus('Snapped Cue #' + (cueIdx + 1) + ' to current video timestamp (' + formatTimestamp(nowTime) + '). Offset set to ' + (newOffset >= 0 ? '+' : '') + newOffset.toFixed(3) + 's.');
+    }
+
+    function toggleSubtitleVisibility() {
+      subtitlesEnabled = !subtitlesEnabled;
+      document.getElementById('subToggleBtn').textContent = 'CC: ' + (subtitlesEnabled ? 'ON' : 'OFF');
+      updateSubtitleOverlay();
+    }
+
+    function cycleSubtitleSize() {
+      subtitleFontIdx = (subtitleFontIdx + 1) % subtitleFontSizes.length;
+      document.getElementById('subtitleLine').style.fontSize = subtitleFontSizes[subtitleFontIdx] + 'px';
+      document.getElementById('subSizeBtn').textContent = 'Font: ' + subtitleFontSizeLabels[subtitleFontIdx];
+    }
+
+    function toggleStageFullscreen() {
+      const stage = document.getElementById('playerStage');
+      if (!document.fullscreenElement) {
+        stage.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+
+    function exportShiftedSrt() {
+      if (!subtitleCues.length) return;
+      const lines = subtitleCues.map((c, idx) => {
+        const s = Math.max(0, c.start + subtitleOffsetSec);
+        const e = Math.max(s + 0.1, c.end + subtitleOffsetSec);
+        return (idx + 1) + '\\n' + formatTimestamp(s).replace('.', ',') + ' --> ' + formatTimestamp(e).replace('.', ',') + '\\n' + c.text;
+      });
+      const blob = new Blob([lines.join('\\n\\n') + '\\n'], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'synced_subtitles_' + (subtitleOffsetSec >= 0 ? 'plus_' : 'minus_') + Math.abs(Math.round(subtitleOffsetSec * 1000)) + 'ms.srt';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    function renderSubtitleCueList(activeIdx) {
+      const container = document.getElementById('subCueList');
+      if (!subtitleCues.length) {
+        container.innerHTML = '<div style="padding:20px; text-align:center; color:var(--text-muted); font-size:12px;">Load any <code>.srt</code>, <code>.vtt</code>, or <code>.ass</code> subtitle file above (or click <em>Load Test Subtitles</em>) to inspect dialogue cues and adjust forward/backward timing with 10ms precision.</div>';
+        return;
+      }
+      const video = document.getElementById('videoPlayer');
+      const vTime = video.currentTime || 0;
+      let centerIdx = activeIdx >= 0 ? activeIdx : subtitleCues.findIndex(c => (c.end + subtitleOffsetSec) >= vTime);
+      if (centerIdx < 0) centerIdx = 0;
+      const startIdx = Math.max(0, centerIdx - 6);
+      const endIdx = Math.min(subtitleCues.length, startIdx + 30);
+
+      let html = '';
+      for (let i = startIdx; i < endIdx; i++) {
+        const c = subtitleCues[i];
+        const shiftedStart = Math.max(0, c.start + subtitleOffsetSec);
+        const isActive = (i === activeIdx);
+        const safeText = c.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\n/g, ' ');
+        html += '<div class="cue-item ' + (isActive ? 'active-cue' : '') + '">' +
+          '<span class="cue-time">#' + c.index + ' • ' + formatTimestamp(shiftedStart).slice(0, 11) + '</span>' +
+          '<span class="cue-text" title="' + safeText + '">' + safeText + '</span>' +
+          '<button class="btn btn-sm" style="padding:2px 8px; font-size:10.5px;" onclick="snapCueToCurrentVideoTime(' + i + ')">⏱ Snap to Video Now</button>' +
+          '</div>';
+      }
+      container.innerHTML = html;
+    }
+
+    function updateSubtitleOverlay() {
+      const video = document.getElementById('videoPlayer');
+      const vTime = video.currentTime || 0;
+      document.getElementById('playerTimeReadout').textContent = formatTimestamp(vTime);
+
+      const lineEl = document.getElementById('subtitleLine');
+      if (!subtitlesEnabled || !subtitleCues.length) {
+        lineEl.textContent = '';
+        return;
+      }
+
+      let foundIdx = -1;
+      const activeTexts = [];
+      for (let i = 0; i < subtitleCues.length; i++) {
+        const c = subtitleCues[i];
+        const s = c.start + subtitleOffsetSec;
+        const e = c.end + subtitleOffsetSec;
+        if (vTime >= s && vTime <= e) {
+          if (foundIdx === -1) foundIdx = i;
+          activeTexts.push(c.text);
+        } else if (s > vTime + 2) {
+          break;
+        }
+      }
+
+      lineEl.textContent = activeTexts.join('\\n');
+      if (foundIdx !== lastActiveCueIdx) {
+        lastActiveCueIdx = foundIdx;
+        renderSubtitleCueList(foundIdx);
+      }
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (['INPUT', 'TEXTAREA'].includes((e.target && e.target.tagName) || '')) return;
+      if (e.key === '[' || e.key === 'g' || e.key === 'G') {
+        nudgeSubtitleOffset(e.shiftKey ? -0.50 : -0.05);
+      } else if (e.key === ']' || e.key === 'h' || e.key === 'H') {
+        nudgeSubtitleOffset(e.shiftKey ? 0.50 : 0.05);
+      }
+    });
+
+    // =========================================================================
+    // Torrent & Swarm Session Controls
+    // =========================================================================
+    async function loadPreset(preset) {
+      const res = await fetch('/api/fixture-magnet?preset=' + encodeURIComponent(preset || 'fixture'));
+      const data = await res.json();
+      document.getElementById('magnetInput').value = data.magnet;
+      showStatus('Loaded preset: ' + (data.label || preset) + '. Click "Stream + Save Full File in Background" to begin.');
+    }
+
+    async function loadFixtureMagnet(preset = 'fixture') {
+      return loadPreset(preset);
+    }
+
+    async function uploadTorrentFile(inputEl) {
+      if (!inputEl.files || !inputEl.files.length) return;
+      const file = inputEl.files[0];
       const buf = await file.arrayBuffer();
       const res = await fetch('/api/upload-torrent?name=' + encodeURIComponent(file.name), {
         method: 'POST',
@@ -2696,7 +3606,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
       const data = await res.json();
       if (data.path) {
         document.getElementById('magnetInput').value = data.path;
-        showStatus('Uploaded ' + file.name + '. Click Stream Video Now or Download Video!');
+        showStatus('Uploaded ' + file.name + '. Click "Stream + Save Full File in Background" or "Download Only".');
       }
     }
 
@@ -2717,12 +3627,40 @@ WEB_UI_HTML = """<!DOCTYPE html>
     }
 
     function formatBytes(bytes) {
-      if (!bytes) return '0 B';
+      if (!bytes || bytes <= 0) return '0 B';
       const units = ['B', 'KiB', 'MiB', 'GiB'];
       let i = 0;
       let val = bytes;
       while (val >= 1024 && i < units.length - 1) { val /= 1024; i++; }
-      return val.toFixed(2) + ' ' + units[i];
+      return val.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
+    }
+
+    function formatEta(sec) {
+      if (sec === 0) return 'Complete (Verified on Disk)';
+      if (sec === null || sec === undefined || !isFinite(sec) || sec < 0) return 'Calculating...';
+      if (sec < 60) return sec + 's remaining';
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      if (m < 60) return m + 'm ' + s + 's remaining';
+      const h = Math.floor(m / 60);
+      return h + 'h ' + (m % 60) + 'm remaining';
+    }
+
+    async function seekToPiece(pieceIdx) {
+      if (!currentTotalPieces) return;
+      try {
+        fetch('/api/seek-piece', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ piece_index: pieceIdx })
+        }).catch(() => {});
+        const video = document.getElementById('videoPlayer');
+        if (video.duration && isFinite(video.duration)) {
+          video.currentTime = (pieceIdx / currentTotalPieces) * video.duration;
+          video.play().catch(() => {});
+        }
+        showStatus('Prioritized Piece #' + pieceIdx + ' (~' + formatBytes(pieceIdx * currentPieceLength) + ') for instant sub-piece streaming.');
+      } catch (_) {}
     }
 
     async function startSession(mode) {
@@ -2733,8 +3671,8 @@ WEB_UI_HTML = """<!DOCTYPE html>
       }
       const finalSource = document.getElementById('magnetInput').value.trim();
       showStatus(mode === 'stream'
-        ? 'Resolving Magnet / Torrent metadata & starting HTTP 206 Range stream...'
-        : 'Resolving Magnet / Torrent metadata & downloading verified pieces...');
+        ? 'Resolving Magnet / Torrent metadata → Launching HTTP 206 Range Stream + Background Disk Persistence...'
+        : 'Resolving Magnet / Torrent metadata → Starting Full Background Disk Download to ./downloads...');
 
       try {
         const res = await fetch('/api/start', {
@@ -2748,19 +3686,27 @@ WEB_UI_HTML = """<!DOCTYPE html>
           return;
         }
 
+        currentSessionSize = data.size || 0;
         document.getElementById('statName').textContent = data.file_name;
+        document.getElementById('playerFileBadge').textContent = data.file_name + ' (' + formatBytes(data.size) + ')';
         document.getElementById('statSize').textContent = formatBytes(data.size);
         document.getElementById('statHash').textContent = data.info_hash;
+        document.getElementById('statDiskPath').textContent = data.output_path;
         document.getElementById('saveDiskLink').style.display = 'inline-flex';
         document.getElementById('saveDiskLink').href = '/download?t=' + Date.now();
 
+        const modePill = document.getElementById('engineModePill');
         if (mode === 'stream') {
+          modePill.className = 'engine-mode-pill streaming';
+          modePill.textContent = 'LIVE STREAMING + SAVING FULL FILE TO DISK';
           const video = document.getElementById('videoPlayer');
           video.src = '/stream?t=' + Date.now();
           video.play().catch(() => {});
-          showStatus('Streaming live via HTTP 206 Partial Content! Seek anywhere on the video timeline.');
+          showStatus('Streaming via HTTP 206 Partial Content AND simultaneously downloading full file to ' + data.output_path);
         } else {
-          showStatus('Downloading full video to ' + data.output_path + ' ...');
+          modePill.className = 'engine-mode-pill streaming';
+          modePill.textContent = 'BACKGROUND DISK DOWNLOAD ACTIVE';
+          showStatus('Downloading full verified file to ' + data.output_path + ' ...');
         }
 
         if (pollTimer) clearInterval(pollTimer);
@@ -2778,13 +3724,61 @@ WEB_UI_HTML = """<!DOCTYPE html>
         const st = await res.json();
         if (!st.active) return;
 
+        currentSessionSize = st.size || currentSessionSize;
+        currentPieceLength = st.piece_length || currentPieceLength;
+        currentTotalPieces = st.total_pieces || currentTotalPieces;
+
         const rawPct = (st.progress || 0) * 100;
         const pctLabel = (rawPct > 0 && rawPct < 1) ? rawPct.toFixed(2) : Math.round(rawPct);
-        const dlBytesStr = st.bytes_downloaded ? ' • ' + formatBytes(st.bytes_downloaded) : '';
-        const speedStr = st.speed_bps ? ' • ' + formatBytes(st.speed_bps) + '/s' : '';
+        const speedStr = formatBytes(st.speed_bps || 0) + '/s';
+
+        document.getElementById('exportPctLabel').textContent = pctLabel + '%';
         document.getElementById('statProgress').textContent =
-          pctLabel + '% (' + st.completed_pieces + '/' + st.total_pieces + ')' + dlBytesStr + speedStr;
-        document.getElementById('progressBar').style.width = Math.min(100, Math.max(rawPct, st.bytes_downloaded ? 1.5 : 0)) + '%';
+          pctLabel + '% (' + st.completed_pieces + ' / ' + st.total_pieces + ' pieces verified)';
+        document.getElementById('progressBar').style.width =
+          Math.min(100, Math.max(rawPct, st.bytes_downloaded ? 1.5 : 0)) + '%';
+
+        document.getElementById('diskWrittenLabel').textContent =
+          formatBytes(st.bytes_downloaded || 0) + ' of ' + formatBytes(st.size || 0) + ' written to disk';
+        document.getElementById('diskEtaLabel').textContent = 'ETA: ' + formatEta(st.eta_seconds);
+
+        document.getElementById('statSpeed').textContent = speedStr;
+        document.getElementById('statSize').textContent =
+          formatBytes(st.size || 0) + ' • ' + formatBytes(st.piece_length || 0) + '/piece';
+        document.getElementById('statPeers').textContent =
+          (st.connected_peers || 0) + ' active TCP / ' + (st.total_swarm_peers || 0) + ' swarm';
+        if (st.output_path) {
+          document.getElementById('statDiskPath').textContent = st.output_path;
+          document.getElementById('pipeDiskPath').textContent = 'Saving full file to ' + st.output_path;
+        }
+
+        document.getElementById('pipeSwarmBadge').textContent = (st.connected_peers || 0) + ' CONNECTED';
+        document.getElementById('pipePeersVal').textContent =
+          (st.connected_peers || 0) + ' Active / ' + (st.total_swarm_peers || 0) + ' Swarm Peers';
+
+        const urgList = (st.urgent_window && st.urgent_window.length)
+          ? ('#' + st.urgent_window.join(', #'))
+          : ('#' + (st.priority_cursor || 0));
+        document.getElementById('pipeUrgentVal').textContent = 'Cursor #' + (st.read_cursor_piece || 0) + ' → [' + urgList + ']';
+        document.getElementById('pipeThroughputVal').textContent = speedStr + (st.seek_epoch ? ' • ' + st.seek_epoch + ' Seeks' : '');
+        document.getElementById('pipeDiskBadge').textContent = st.complete ? '100% SAVED ON DISK' : 'WRITING TO DISK';
+        document.getElementById('pipeDiskVal').textContent =
+          formatBytes(st.bytes_downloaded || 0) + ' / ' + formatBytes(st.size || 0);
+        document.getElementById('diskPersistenceStateBadge').textContent =
+          st.complete ? '✓ 100% SHA-1 VERIFIED ON DISK' : '● SAVING IN BACKGROUND (' + speedStr + ')';
+
+        const readyAheadPieces = st.lookahead_ready_pieces || 0;
+        const activeSubBlocks = st.in_progress_blocks || 0;
+        const activeSubBytes = activeSubBlocks * 16384;
+        const readyAheadBytes = readyAheadPieces * (st.piece_length || 0) + activeSubBytes;
+        const targetLookaheadBytes = Math.min(st.size || 1, Math.max((st.piece_length || 32768) * 4, 16 * 1024 * 1024));
+        const lookaheadPct = st.complete ? 100 : Math.min(100, Math.round((readyAheadBytes / targetLookaheadBytes) * 100));
+        document.getElementById('lookaheadBar').style.width = Math.max(lookaheadPct, activeSubBlocks ? 8 : 0) + '%';
+        document.getElementById('lookaheadBufferLabel').textContent =
+          st.complete ? 'Full File Buffered (100%)' : (formatBytes(readyAheadBytes) + ' ready ahead of cursor');
+        document.getElementById('urgentWindowPiecesLabel').textContent = 'Urgent Window: ' + urgList;
+        document.getElementById('subPieceBlocksLabel').textContent =
+          activeSubBlocks + ' sub-piece blocks (' + formatBytes(activeSubBytes) + ') in-flight across ' + (st.active_pieces_count || 0) + ' active pieces';
 
         const grid = document.getElementById('pieceGrid');
         if (st.pieces) {
@@ -2793,19 +3787,27 @@ WEB_UI_HTML = """<!DOCTYPE html>
             for (let i = 0; i < st.pieces.length; i++) {
               const cell = document.createElement('div');
               cell.className = 'piece-cell ' + st.pieces[i];
-              cell.title = 'Piece #' + i;
+              cell.onclick = () => seekToPiece(i);
+              cell.onmouseenter = () => {
+                const startOff = formatBytes(i * (st.piece_length || 0));
+                document.getElementById('pieceHoverInfo').textContent =
+                  'Piece #' + i + ' (' + startOff + ') • State: ' + st.pieces[i].toUpperCase() + ' (Click to seek)';
+              };
               grid.appendChild(cell);
             }
           } else {
             for (let i = 0; i < st.pieces.length; i++) {
-              grid.children[i].className = 'piece-cell ' + st.pieces[i];
+              const cname = 'piece-cell ' + st.pieces[i];
+              if (grid.children[i].className !== cname) {
+                grid.children[i].className = cname;
+              }
             }
           }
         }
 
         if (st.complete && mode === 'download' && !window._dlTriggered) {
           window._dlTriggered = true;
-          showStatus('Download 100% SHA-1 Verified! Saved to ' + st.output_path + '. Triggering browser download...');
+          showStatus('Download 100% SHA-1 Verified! Saved to ' + st.output_path + '. Triggering browser file save...');
           const a = document.createElement('a');
           a.href = '/download';
           a.download = st.file_name || 'video.mp4';
@@ -2817,15 +3819,24 @@ WEB_UI_HTML = """<!DOCTYPE html>
     }
 
     window.addEventListener('DOMContentLoaded', async () => {
+      const video = document.getElementById('videoPlayer');
+      video.addEventListener('timeupdate', updateSubtitleOverlay);
+      video.addEventListener('seeking', updateSubtitleOverlay);
+      video.addEventListener('seeked', updateSubtitleOverlay);
+      setInterval(updateSubtitleOverlay, 45);
+
       await loadFixtureMagnet();
       const res = await fetch('/status');
       const st = await res.json();
       if (st.active) {
         document.getElementById('statName').textContent = st.file_name;
+        document.getElementById('playerFileBadge').textContent = st.file_name + ' (' + formatBytes(st.size) + ')';
         document.getElementById('statSize').textContent = formatBytes(st.size);
         document.getElementById('statHash').textContent = st.info_hash;
         document.getElementById('saveDiskLink').style.display = 'inline-flex';
-        const video = document.getElementById('videoPlayer');
+        const modePill = document.getElementById('engineModePill');
+        modePill.className = 'engine-mode-pill streaming';
+        modePill.textContent = 'LIVE STREAMING + SAVING FULL FILE TO DISK';
         video.src = '/stream';
         pollTimer = setInterval(() => pollStatus('stream'), 250);
       }
@@ -2854,10 +3865,11 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 class VideoStreamServer:
     """
     HTTP Server providing:
-    - `GET /` : Interactive Web UI to paste magnet links and stream/download videos
-    - `GET /api/fixture-magnet` : Returns a live `magnet:?xt=urn:btih:...` test fixture URI
+    - `GET /` : Studio Web UI to paste magnet links, stream/download videos, and sync subtitles
+    - `GET /api/fixture-magnet` : Returns a live `magnet:?xt=urn:btih:...` preset URI
     - `POST /api/upload-torrent` : Uploads a `.torrent` file from browser
     - `POST /api/start` : Starts a new `TorrentVideoSession` from any magnet URI or `.torrent` path
+    - `POST /api/seek-piece` : Immediately prioritizes a clicked piece from the UI Piece Map
     - `GET /stream` : HTTP 206 Partial Content Range video streamer
     - `GET /download` : Direct attachment download of the verified video file
     - `GET /status` : Real-time JSON telemetry and piece state array
@@ -2937,18 +3949,34 @@ class VideoStreamServer:
                     self._send_json(200, {"ok": True, "path": str(target)})
                     return
 
+                if self.path.startswith("/api/seek-piece"):
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                    store = outer.store
+                    if store is not None:
+                        p_idx = int(body.get("piece_index", 0))
+                        byte_off = max(0, p_idx * store.metadata.piece_length - store.target_file.offset)
+                        store.prioritize_byte_range(byte_off, byte_off + 65536)
+                        self._send_json(200, {"ok": True, "piece_index": p_idx})
+                        return
+                    self._send_json(404, {"error": "No active store"})
+                    return
+
                 if self.path.startswith("/api/start"):
                     length = int(self.headers.get("Content-Length", "0"))
                     body = json.loads(self.rfile.read(length).decode("utf-8"))
                     source = body.get("source", "").strip()
+                    mode = body.get("mode", "stream").strip()
                     if not source:
                         source = get_default_fixture_magnet()
                     try:
                         sess = TorrentVideoSession(source, outer.output_dir, sliding_window_pieces=16)
+                        setattr(sess, "session_mode", mode)
                         sess.start_swarm()
                         outer.switch_session(sess)
                         self._send_json(200, {
                             "ok": True,
+                            "mode": mode,
                             "info_hash": sess.metadata.info_hash.hex(),
                             "file_name": Path(sess.target_file.path).name,
                             "size": sess.target_file.length,
@@ -3000,6 +4028,10 @@ class VideoStreamServer:
                         snap["info_hash"] = sess.metadata.info_hash.hex()
                         snap["file_name"] = Path(sess.target_file.path).name
                         snap["output_path"] = str(sess.output_path)
+                        snap["mode"] = getattr(sess, "session_mode", "stream")
+                        snap["connected_peers"] = sum(1 for w in sess.workers if getattr(w, "connected", False))
+                        snap["total_swarm_peers"] = len(sess.explicit_peers)
+                        snap["webseeds_count"] = len(sess.web_seeds) * 8
                     self._send_json(200, snap)
                     return
 
