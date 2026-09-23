@@ -456,24 +456,52 @@ class SparseVideoPieceStore:
 
     def prioritize_byte_range(self, start_byte: int, end_byte: int) -> None:
         start_piece = self.piece_for_file_offset(start_byte)
-        window_pieces = 2 if self.metadata.piece_length >= 1048576 else self.sliding_window_pieces
-        end_piece = self.piece_for_file_offset(min(end_byte, start_byte + window_pieces * self.metadata.piece_length))
+        lookahead_count = 6 if self.metadata.piece_length >= 1048576 else self.sliding_window_pieces
         with self._lock:
-            self._priority_cursor = start_piece
-            new_urgent = [
-                p for p in range(start_piece, min(self.last_piece + 1, end_piece + window_pieces))
-                if p not in self.completed_pieces
-            ]
+            # Advance cursor past already-completed contiguous pieces so the urgent lookahead
+            # window ALWAYS stays 6 uncompleted pieces (48 MiB) ahead of the video player!
+            first_missing = start_piece
+            while first_missing <= self.last_piece and first_missing in self.completed_pieces:
+                first_missing += 1
+            self._priority_cursor = min(first_missing, self.last_piece)
+
+            new_urgent: List[int] = []
+            cursor = first_missing
+            while cursor <= self.last_piece and len(new_urgent) < lookahead_count:
+                if cursor not in self.completed_pieces:
+                    new_urgent.append(cursor)
+                cursor += 1
+
             for p in self._urgent_pieces:
-                if p not in new_urgent and p not in self.completed_pieces:
+                if p >= start_piece and p not in new_urgent and p not in self.completed_pieces and len(new_urgent) < lookahead_count + 2:
                     new_urgent.append(p)
             self._urgent_pieces = new_urgent
             self._lock.notify_all()
 
-    def next_piece_to_download(self, peer_bitfield: Optional[Set[int]] = None, allow_steal_after: float = 0.7) -> Optional[int]:
+    def _has_assignable_blocks_locked(self, piece_index: int, now: float, steal_after: float = 2.4) -> bool:
+        if piece_index in self.completed_pieces:
+            return False
+        plen = self.metadata.piece_size(piece_index)
+        received = self._received_blocks.get(piece_index)
+        claimed = self._claimed_blocks.get(piece_index)
+        if not claimed:
+            return True
+        total_blocks = (plen + BLOCK_SIZE - 1) // BLOCK_SIZE
+        rec_count = len(received) if received else 0
+        if rec_count >= total_blocks:
+            return False
+        if len(claimed) + rec_count < total_blocks:
+            return True
+        for begin, ts in claimed.items():
+            if (not received or begin not in received) and (now - ts) >= steal_after:
+                return True
+        return False
+
+    def next_piece_to_download(self, peer_bitfield: Optional[Set[int]] = None, allow_steal_after: float = 1.5) -> Optional[int]:
         with self._lock:
             now = time.monotonic()
-            # When pieces are >= 512 KiB, let ALL peers swarm-stripe the urgent piece simultaneously!
+            # When pieces are >= 512 KiB, let multiple peers cooperatively stripe across the
+            # rolling urgent window (up to 6 pieces ahead) without idling once a piece's blocks are claimed.
             cooperative_large = self.metadata.piece_length >= 524288
 
             def eligible(p: int, can_steal: bool = False) -> bool:
@@ -481,9 +509,9 @@ class SparseVideoPieceStore:
                     return False
                 if peer_bitfield is not None and p not in peer_bitfield:
                     return False
+                if cooperative_large:
+                    return self._has_assignable_blocks_locked(p, now, steal_after=(1.8 if can_steal else 2.6))
                 if p in self.in_progress_pieces:
-                    if cooperative_large and p in self._urgent_pieces[:2]:
-                        return True
                     if can_steal and (now - self.in_progress_since.get(p, now)) >= allow_steal_after:
                         return True
                     return False
@@ -492,7 +520,15 @@ class SparseVideoPieceStore:
             while self._urgent_pieces and self._urgent_pieces[0] in self.completed_pieces:
                 self._urgent_pieces.pop(0)
 
-            # 1. Unclaimed (or cooperative large) urgent pieces first
+            # Ensure _urgent_pieces always has lookahead pieces if any remain
+            if len(self._urgent_pieces) < 4:
+                scan_p = self._priority_cursor
+                while scan_p <= self.last_piece and len(self._urgent_pieces) < 6:
+                    if scan_p not in self.completed_pieces and scan_p not in self._urgent_pieces:
+                        self._urgent_pieces.append(scan_p)
+                    scan_p += 1
+
+            # 1. Unclaimed (or cooperative large with assignable blocks) urgent pieces first
             for p in self._urgent_pieces:
                 if eligible(p, can_steal=False):
                     self.in_progress_pieces.add(p)
@@ -502,6 +538,7 @@ class SparseVideoPieceStore:
             # 2. Steal slow in-progress urgent pieces (Endgame / Straggler protection for streaming)
             for p in self._urgent_pieces:
                 if eligible(p, can_steal=True):
+                    self.in_progress_pieces.add(p)
                     self.in_progress_since[p] = now
                     return p
 
@@ -509,14 +546,14 @@ class SparseVideoPieceStore:
             for p in range(self._priority_cursor, self.last_piece + 1):
                 if eligible(p, can_steal=False):
                     self.in_progress_pieces.add(p)
-                    self.in_progress_since[p] = now
+                    self.in_progress_since.setdefault(p, now)
                     return p
 
             # 4. Wrap around to earlier missing pieces
             for p in range(self.first_piece, self._priority_cursor):
                 if eligible(p, can_steal=False):
                     self.in_progress_pieces.add(p)
-                    self.in_progress_since[p] = now
+                    self.in_progress_since.setdefault(p, now)
                     return p
 
             # 5. Endgame mode: if all remaining pieces are in-progress on slow peers, race them
@@ -527,10 +564,10 @@ class SparseVideoPieceStore:
 
             return None
 
-    def next_block_batch_for_piece(self, piece_index: int, batch_size: int = 16) -> List[Tuple[int, int]]:
+    def next_block_batch_for_piece(self, piece_index: int, batch_size: int = 24) -> List[Tuple[int, int]]:
         """
         Cooperative block allocator for large pieces: multiple peers claim non-overlapping
-        16 KiB blocks of the same piece in sequential order, stealing straggler blocks after 1.2s.
+        16 KiB blocks of the same piece in sequential order, stealing straggler blocks after 2.4s.
         """
         with self._lock:
             if piece_index in self.completed_pieces:
@@ -551,11 +588,11 @@ class SparseVideoPieceStore:
                     if len(out) >= batch_size:
                         return out
 
-            # Pass 2: steal straggler blocks claimed > 1.2s ago
+            # Pass 2: steal straggler blocks claimed >= 2.4s ago
             for begin in range(0, plen, BLOCK_SIZE):
                 if begin in received:
                     continue
-                if (now - claimed.get(begin, 0.0)) >= 1.2:
+                if (now - claimed.get(begin, 0.0)) >= 2.4:
                     claimed[begin] = now
                     out.append((begin, min(BLOCK_SIZE, plen - begin)))
                     if len(out) >= batch_size:
@@ -601,6 +638,7 @@ class SparseVideoPieceStore:
                 rec.add(begin)
                 self.bytes_downloaded += len(block)
                 self._speed_samples.append((time.monotonic(), len(block)))
+            self._claimed_blocks.get(piece_index, {}).pop(begin, None)
 
             total_blocks = (plen + BLOCK_SIZE - 1) // BLOCK_SIZE
             if len(rec) >= total_blocks:
@@ -676,8 +714,9 @@ class SparseVideoPieceStore:
 
     def release_in_progress(self, piece_index: int) -> None:
         with self._lock:
-            self.in_progress_pieces.discard(piece_index)
-            self.in_progress_since.pop(piece_index, None)
+            if piece_index not in self._received_blocks:
+                self.in_progress_pieces.discard(piece_index)
+                self.in_progress_since.pop(piece_index, None)
             self._lock.notify_all()
 
     def verify_and_store_piece(self, piece_index: int, data: bytes) -> bool:
@@ -728,7 +767,10 @@ class SparseVideoPieceStore:
         end_piece = self.piece_for_file_offset(end_offset)
         needed = set(range(start_piece, end_piece + 1))
 
-        self.prioritize_byte_range(file_offset, end_offset)
+        # Only re-trigger lookahead prioritization when crossing a piece boundary or if piece is missing
+        if not needed.issubset(self.completed_pieces) or getattr(self, "_last_read_piece", -1) != start_piece:
+            self._last_read_piece = start_piece
+            self.prioritize_byte_range(file_offset, end_offset)
 
         deadline = time.monotonic() + timeout
         with self._lock:
@@ -742,7 +784,7 @@ class SparseVideoPieceStore:
                     raise TimeoutError(
                         f"Timed out waiting for pieces {missing} (offset={file_offset}, len={length})"
                     )
-                self._lock.wait(timeout=min(0.2, remaining))
+                self._lock.wait(timeout=min(0.15, remaining))
             data = os.pread(self._fd, length, file_offset)
             # If streaming an incomplete Matroska (.mkv) file from offset 0, mask SeekID=Cues (1c53bb6b)
             # in SeekHead so the video player immediately plays Cluster 0 (at byte ~816) instead of
@@ -1121,7 +1163,7 @@ def fetch_magnet_metadata_from_peer(
 # 5. BitTorrent Peer Worker (BEP 0003 + BEP 0006 + BEP 0010/0011 PEX)
 # ============================================================================
 
-MAX_PIPELINE_BLOCKS = 24  # Max 24 in-flight 16 KiB block requests per peer (384 KiB window)
+MAX_PIPELINE_BLOCKS = 32  # Max 32 in-flight 16 KiB block requests per peer (512 KiB window)
 MSG_HAVE_ALL = 14
 MSG_HAVE_NONE = 15
 
@@ -2000,7 +2042,7 @@ class TorrentVideoSession:
         if self.stop_event.is_set() or self.store.is_complete:
             return
         for p in new_peers:
-            if p not in self.explicit_peers and len(self.workers) < 85:
+            if p not in self.explicit_peers and len(self.workers) < 110:
                 self.explicit_peers.append(p)
                 worker = PeerWorker(
                     peer_addr=p,
@@ -2012,6 +2054,33 @@ class TorrentVideoSession:
                 )
                 worker.start()
                 self.workers.append(worker)
+
+    def _background_swarm_expander(self) -> None:
+        """Continuously discover fresh seeders from trackers & DHT while video is streaming."""
+        while not self.stop_event.is_set() and not self.store.is_complete:
+            try:
+                if self.metadata.info_hash.hex() in _GLOBAL_FIXTURE_SEEDERS:
+                    return
+                trackers = list(DEFAULT_PUBLIC_TRACKERS)
+                for mtr in self.metadata.announce_list:
+                    if mtr not in trackers:
+                        trackers.append(mtr)
+                fresh = discover_peers_from_trackers(
+                    trackers,
+                    self.metadata.info_hash,
+                    self.peer_id,
+                    left=max(0, self.target_file.length - self.store.bytes_downloaded),
+                    timeout=2.5,
+                )
+                if fresh:
+                    self._on_pex_peers(fresh)
+                dht_fresh = query_dht_for_peers(self.metadata.info_hash, timeout=2.5)
+                if dht_fresh:
+                    self._on_pex_peers(dht_fresh)
+            except Exception:
+                pass
+            if self.stop_event.wait(timeout=12.0):
+                break
 
     def start_swarm(self) -> None:
         discovered = list(self.explicit_peers)
@@ -2053,8 +2122,8 @@ class TorrentVideoSession:
                 ws_worker.start()
                 self.workers.append(ws_worker)
 
-        # 2. Start up to 50 concurrent TCP Peer Workers (BEP 0003 + BEP 0011 PEX)
-        for peer_addr in discovered[:50]:
+        # 2. Start up to 65 concurrent TCP Peer Workers (BEP 0003 + BEP 0011 PEX)
+        for peer_addr in discovered[:65]:
             worker = PeerWorker(
                 peer_addr=peer_addr,
                 metadata=self.metadata,
@@ -2065,6 +2134,9 @@ class TorrentVideoSession:
             )
             worker.start()
             self.workers.append(worker)
+
+        # 3. Launch continuous background tracker + DHT peer discovery
+        threading.Thread(target=self._background_swarm_expander, daemon=True).start()
 
     def start_http_stream(self, host: str = "127.0.0.1", port: int = 0) -> str:
         self.stream_server = VideoStreamServer(self.store, host=host, port=port, session=self)
@@ -2804,7 +2876,9 @@ class VideoStreamServer:
 
                 cursor = start_byte
                 while cursor <= end_byte:
-                    to_read = min(65536, (end_byte - cursor) + 1)
+                    cur_piece = store.piece_for_file_offset(cursor)
+                    step = 524288 if cur_piece in store.completed_pieces else 65536
+                    to_read = min(step, (end_byte - cursor) + 1)
                     chunk = store.read_video_bytes(cursor, to_read, timeout=45.0)
                     if not chunk:
                         break
