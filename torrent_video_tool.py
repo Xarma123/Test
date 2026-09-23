@@ -597,7 +597,7 @@ class SparseVideoPieceStore:
             urgent_begin = self._urgent_block_offsets.get(piece_index, 0)
             for b in range(urgent_begin, min(plen, urgent_begin + 16 * BLOCK_SIZE), BLOCK_SIZE):
                 if not received or b not in received:
-                    if b not in claimed or (now - claimed[b]) >= 0.45:
+                    if b not in claimed or (now - claimed[b]) >= 1.1:
                         return True
         total_blocks = (plen + BLOCK_SIZE - 1) // BLOCK_SIZE
         rec_count = len(received) if received else 0
@@ -605,7 +605,7 @@ class SparseVideoPieceStore:
             return False
         if len(claimed) + rec_count < total_blocks:
             return True
-        effective_steal = 0.65 if is_head else steal_after
+        effective_steal = 1.1 if is_head else steal_after
         for begin, ts in claimed.items():
             if (not received or begin not in received) and (now - ts) >= effective_steal:
                 return True
@@ -622,7 +622,7 @@ class SparseVideoPieceStore:
                 if peer_bitfield is not None and p not in peer_bitfield:
                     return False
                 if cooperative_large:
-                    return self._has_assignable_blocks_locked(p, now, steal_after=(0.65 if can_steal else 2.0))
+                    return self._has_assignable_blocks_locked(p, now, steal_after=(1.1 if can_steal else 2.0))
                 if p in self.in_progress_pieces:
                     if can_steal and (now - self.in_progress_since.get(p, now)) >= allow_steal_after:
                         return True
@@ -676,14 +676,20 @@ class SparseVideoPieceStore:
 
             return None
 
-    def next_block_batch_for_piece(self, piece_index: int, batch_size: int = 24) -> List[Tuple[int, int]]:
+    def next_block_batch_for_piece(
+        self,
+        piece_index: int,
+        batch_size: int = 24,
+        exclude_offsets: Optional[Set[int]] = None,
+    ) -> List[Tuple[int, int]]:
         """
         Cooperative block allocator for large pieces:
         1. Starts allocation at `_urgent_block_offsets[piece_index]` (the exact 16 KiB block where
            the video player sought) before wrapping around to block 0.
-        2. Prioritizes unclaimed AND straggler (>= 0.45s) blocks in the critical 16-block (256 KiB)
-           seek-head window BEFORE allocating blocks further down an 8 MiB piece, so a slow peer
-           can NEVER hold up the seek-head while fast seeders download blocks megabytes ahead!
+        2. Never assigns a block in `exclude_offsets` (blocks already in-flight on the calling
+           peer's own TCP connection), preventing duplicate `MSG_REQUEST` protocol errors.
+        3. Races straggler blocks (>= 1.1s) in the critical 16-block (256 KiB) seek-head window
+           across other peers while allowing fast seeders to pipeline full 16-block batches.
         """
         with self._lock:
             if piece_index in self.completed_pieces:
@@ -699,8 +705,8 @@ class SparseVideoPieceStore:
             if urgent_begin >= plen:
                 urgent_begin = 0
 
-            effective_batch = min(batch_size, 8) if is_head_urgent else batch_size
-            steal_timeout = 0.45 if is_head_urgent else 2.0
+            effective_batch = min(batch_size, 16) if is_head_urgent else batch_size
+            steal_timeout = 1.1 if is_head_urgent else 2.0
 
             ordered_offsets = (
                 list(range(urgent_begin, plen, BLOCK_SIZE))
@@ -708,14 +714,14 @@ class SparseVideoPieceStore:
             )
 
             # Pass 0 (Seek-Head Priority & Hedging): Ensure the first 16 blocks (256 KiB) at
-            # urgent_begin are claimed AND stolen (after 0.45s) BEFORE any peer is assigned blocks
-            # further down the 8 MiB piece!
+            # urgent_begin are claimed AND stolen (after 1.1s by a DIFFERENT peer) BEFORE
+            # allocating blocks further down the 8 MiB piece.
             if is_head_urgent:
                 critical_head = ordered_offsets[:16]
                 for begin in critical_head:
-                    if begin in received:
+                    if begin in received or (exclude_offsets and begin in exclude_offsets):
                         continue
-                    if begin not in claimed or (now - claimed.get(begin, 0.0)) >= 0.45:
+                    if begin not in claimed or (now - claimed.get(begin, 0.0)) >= 1.1:
                         claimed[begin] = now
                         out.append((begin, min(BLOCK_SIZE, plen - begin)))
                         if len(out) >= effective_batch:
@@ -723,16 +729,16 @@ class SparseVideoPieceStore:
 
             # Pass 1: unclaimed blocks starting at urgent_begin
             for begin in ordered_offsets:
-                if begin in received or begin in claimed:
+                if begin in received or begin in claimed or (exclude_offsets and begin in exclude_offsets):
                     continue
                 claimed[begin] = now
                 out.append((begin, min(BLOCK_SIZE, plen - begin)))
                 if len(out) >= effective_batch:
                     return out
 
-            # Pass 2: steal straggler blocks starting at urgent_begin
+            # Pass 2: steal straggler blocks starting at urgent_begin (from other peers only)
             for begin in ordered_offsets:
-                if begin in received:
+                if begin in received or (exclude_offsets and begin in exclude_offsets):
                     continue
                 if (now - claimed.get(begin, 0.0)) >= steal_timeout:
                     claimed[begin] = now
@@ -1321,12 +1327,15 @@ def fetch_magnet_metadata_from_peer(
 # ============================================================================
 
 MAX_PIPELINE_BLOCKS = 32  # Max 32 in-flight 16 KiB block requests per peer (512 KiB window)
+MSG_SUGGEST_PIECE = 13
 MSG_HAVE_ALL = 14
 MSG_HAVE_NONE = 15
+MSG_REJECT_REQUEST = 16
+MSG_ALLOWED_FAST = 17
 
 
 class PeerWorker(threading.Thread):
-    """Downloads pieces/blocks from a single BitTorrent peer using BEP 0003 wire protocol."""
+    """Downloads pieces/blocks from a single BitTorrent peer using BEP 0003/0006/0010 wire protocol."""
 
     def __init__(
         self,
@@ -1335,7 +1344,8 @@ class PeerWorker(threading.Thread):
         store: SparseVideoPieceStore,
         peer_id: bytes,
         stop_event: threading.Event,
-        on_pex_peers: Optional[ Any ] = None,
+        on_pex_peers: Optional[Any] = None,
+        on_verified_seeder: Optional[Any] = None,
     ) -> None:
         super().__init__(daemon=True)
         self.peer_addr = peer_addr
@@ -1344,32 +1354,57 @@ class PeerWorker(threading.Thread):
         self.peer_id = peer_id
         self.stop_event = stop_event
         self.on_pex_peers = on_pex_peers
+        self.on_verified_seeder = on_verified_seeder
         self.connected = False
+        self.verified_seeder = False
+        self._consecutive_failures = 0
+        self._peer_max_pipeline = MAX_PIPELINE_BLOCKS
+
+    def _mark_verified_seeder(self) -> None:
+        self._consecutive_failures = 0
+        if not self.verified_seeder:
+            self.verified_seeder = True
+            if self.on_verified_seeder is not None:
+                try:
+                    self.on_verified_seeder(self.peer_addr)
+                except Exception:
+                    pass
 
     def run(self) -> None:
-        attempts = 0
-        while not self.stop_event.is_set() and not self.store.is_complete and attempts < 3:
+        while not self.stop_event.is_set() and not self.store.is_complete:
+            max_failures = 10 if self.verified_seeder else 2
+            if self._consecutive_failures >= max_failures:
+                break
             try:
                 self._session()
             except Exception:
                 self.connected = False
-                attempts += 1
-                time.sleep(0.25)
+                self._consecutive_failures += 1
+                time.sleep(0.2 if self.verified_seeder else 0.3)
 
-    def _handle_pex(self, ext_body: bytes) -> None:
-        if self.on_pex_peers is None:
+    def _handle_extended(self, payload: bytes) -> None:
+        if len(payload) <= 1:
             return
+        ext_id = payload[0]
+        ext_body = payload[1:]
         try:
-            pex_dict = bdecode(ext_body)
-            new_peers = _extract_compact_peers(pex_dict.get(b"added", b""))
-            if new_peers:
-                self.on_pex_peers(new_peers)
+            ext_dict = bdecode(ext_body)
+            if not isinstance(ext_dict, dict):
+                return
+            if ext_id == 0:
+                reqq = ext_dict.get(b"reqq")
+                if isinstance(reqq, int) and reqq > 0:
+                    self._peer_max_pipeline = max(8, min(MAX_PIPELINE_BLOCKS, reqq))
+            if b"added" in ext_dict and self.on_pex_peers is not None:
+                new_peers = _extract_compact_peers(ext_dict.get(b"added", b""))
+                if new_peers:
+                    self.on_pex_peers(new_peers)
         except Exception:
             pass
 
     def _session(self) -> None:
-        with socket.create_connection(self.peer_addr, timeout=3.5) as sock:
-            sock.settimeout(4.5)
+        with socket.create_connection(self.peer_addr, timeout=3.0) as sock:
+            sock.settimeout(3.5)
             pstr = b"BitTorrent protocol"
             reserved = bytearray(8)
             reserved[5] = 0x10  # BEP 0010 Extension Protocol
@@ -1382,46 +1417,72 @@ class PeerWorker(threading.Thread):
                 raise ConnectionError("Invalid peer handshake")
 
             self.connected = True
+            sock.settimeout(7.5)
             if resp[25] & 0x10:
-                ext_hs = bencode({b"m": {b"ut_metadata": 1, b"ut_pex": 2}})
+                ext_hs = bencode({b"m": {b"ut_metadata": 1, b"ut_pex": 2}, b"reqq": 64})
                 _send_msg(sock, MSG_EXTENDED, struct.pack("!B", 0) + ext_hs)
             _send_msg(sock, MSG_INTERESTED)
 
             peer_choking = True
+            choke_since = time.monotonic()
             peer_pieces: Set[int] = set(range(self.metadata.num_pieces))
+            got_pex = False
+            empty_since: Optional[float] = None
 
             while not self.stop_event.is_set() and not self.store.is_complete:
+                if not peer_pieces:
+                    # Peer has 0 pieces: keep connection up to 2.2s solely to harvest BEP-11 ut_pex seeders, then drop
+                    if got_pex or (empty_since is not None and (time.monotonic() - empty_since) > 2.2):
+                        return
+
                 if peer_choking:
+                    if (time.monotonic() - choke_since) > 5.0:
+                        raise TimeoutError("Peer remained choked > 5.0s")
                     msg_id, payload = self._read_message(sock)
                     if msg_id == MSG_UNCHOKE:
                         peer_choking = False
                     elif msg_id == MSG_CHOKE:
                         peer_choking = True
+                        choke_since = time.monotonic()
                     elif msg_id == MSG_HAVE and len(payload) >= 4:
                         idx = struct.unpack("!I", payload[:4])[0]
                         peer_pieces.add(idx)
+                        empty_since = None
                     elif msg_id == MSG_BITFIELD:
                         peer_pieces = self._parse_bitfield(payload)
+                        if not peer_pieces and empty_since is None:
+                            empty_since = time.monotonic()
                     elif msg_id == MSG_HAVE_ALL:
                         peer_pieces = set(range(self.metadata.num_pieces))
+                        empty_since = None
                     elif msg_id == MSG_HAVE_NONE:
                         peer_pieces = set()
-                    elif msg_id == MSG_EXTENDED and len(payload) > 1 and payload[0] == 2:
-                        self._handle_pex(payload[1:])
+                        if empty_since is None:
+                            empty_since = time.monotonic()
+                    elif msg_id == MSG_EXTENDED:
+                        if len(payload) > 1 and payload[0] != 0:
+                            got_pex = True
+                        self._handle_extended(payload)
                     continue
 
                 piece_idx = self.store.next_piece_to_download(peer_pieces)
                 if piece_idx is None:
+                    if empty_since is None:
+                        empty_since = time.monotonic()
+                    elif got_pex or (time.monotonic() - empty_since) > 2.2:
+                        return
                     time.sleep(0.04)
                     continue
+                empty_since = None
 
                 try:
-                    piece_data = self._download_piece(sock, piece_idx)
+                    piece_data = self._download_piece(sock, piece_idx, peer_pieces)
                     if piece_data is not None:
                         if len(piece_data) > 0:
                             self.store.verify_and_store_piece(piece_idx, piece_data)
                     else:
                         peer_choking = True
+                        choke_since = time.monotonic()
                         self.store.release_in_progress(piece_idx)
                 except Exception:
                     self.store.release_in_progress(piece_idx)
@@ -1446,50 +1507,68 @@ class PeerWorker(threading.Thread):
             payload = _recv_exact(sock, length - 1) if length > 1 else b""
             return msg_id, payload
 
-    def _download_piece(self, sock: socket.socket, piece_idx: int) -> Optional[bytes]:
+    def _download_piece(self, sock: socket.socket, piece_idx: int, peer_pieces: Optional[Set[int]] = None) -> Optional[bytes]:
         if self.metadata.piece_length >= 524288:
-            # Cooperative sub-piece 16 KiB block streaming for large pieces (e.g. 8 MiB MKV):
-            # All connected peers simultaneously claim non-overlapping 16 KiB blocks starting at
-            # the exact seek offset (`_urgent_block_offsets`) and immediately preempt if user seeks.
             worker_epoch = self.store.seek_epoch
             inflight_blocks: Dict[Tuple[int, int], int] = {}
-            while not self.stop_event.is_set() and piece_idx not in self.store.completed_pieces:
-                if self.store.should_preempt_piece(piece_idx, worker_epoch):
-                    if inflight_blocks:
-                        unclaim_list = [b for (p, b) in inflight_blocks if p == piece_idx]
-                        for (p, b), blen in list(inflight_blocks.items()):
-                            try:
-                                _send_msg(sock, MSG_CANCEL, struct.pack("!III", p, b, blen))
-                            except Exception:
-                                break
-                        self.store.unclaim_blocks(piece_idx, unclaim_list)
-                    self.store.release_in_progress(piece_idx)
-                    return b""
+            pipeline_cap = self._peer_max_pipeline
+            blocks_transferred = 0
+            try:
+                while not self.stop_event.is_set() and piece_idx not in self.store.completed_pieces:
+                    if self.store.should_preempt_piece(piece_idx, worker_epoch):
+                        if inflight_blocks:
+                            for (p, b), blen in list(inflight_blocks.items()):
+                                try:
+                                    _send_msg(sock, MSG_CANCEL, struct.pack("!III", p, b, blen))
+                                except Exception:
+                                    break
+                        return b""
 
-                if len(inflight_blocks) < MAX_PIPELINE_BLOCKS:
-                    batch = self.store.next_block_batch_for_piece(
-                        piece_idx, batch_size=(MAX_PIPELINE_BLOCKS - len(inflight_blocks))
-                    )
-                    for begin, blen in batch:
-                        _send_msg(sock, MSG_REQUEST, struct.pack("!III", piece_idx, begin, blen))
-                        inflight_blocks[(piece_idx, begin)] = blen
-                if not inflight_blocks:
-                    break
-                msg_id, payload = self._read_message(sock)
-                if msg_id == MSG_CHOKE:
-                    if inflight_blocks:
-                        self.store.unclaim_blocks(
-                            piece_idx, [b for (p, b) in inflight_blocks if p == piece_idx]
+                    if len(inflight_blocks) < pipeline_cap:
+                        own_inflight = {b for (p, b) in inflight_blocks if p == piece_idx}
+                        batch = self.store.next_block_batch_for_piece(
+                            piece_idx,
+                            batch_size=(pipeline_cap - len(inflight_blocks)),
+                            exclude_offsets=own_inflight,
                         )
-                    return None
-                elif msg_id == MSG_PIECE and len(payload) >= 8:
-                    r_idx, r_begin = struct.unpack("!II", payload[:8])
-                    block = payload[8:]
-                    inflight_blocks.pop((r_idx, r_begin), None)
-                    self.store.store_block(r_idx, r_begin, block)
-                elif msg_id == MSG_EXTENDED and len(payload) > 1 and payload[0] == 2:
-                    self._handle_pex(payload[1:])
-            return b""
+                        for begin, blen in batch:
+                            if (piece_idx, begin) not in inflight_blocks:
+                                _send_msg(sock, MSG_REQUEST, struct.pack("!III", piece_idx, begin, blen))
+                                inflight_blocks[(piece_idx, begin)] = blen
+                    if not inflight_blocks:
+                        if blocks_transferred == 0:
+                            time.sleep(0.03)
+                        break
+
+                    msg_id, payload = self._read_message(sock)
+                    if msg_id == MSG_CHOKE:
+                        return None
+                    elif msg_id == MSG_UNCHOKE:
+                        self._mark_verified_seeder()
+                    elif msg_id == MSG_REJECT_REQUEST and len(payload) >= 12:
+                        r_idx, r_begin, _r_len = struct.unpack("!III", payload[:12])
+                        inflight_blocks.pop((r_idx, r_begin), None)
+                        self.store.unclaim_blocks(r_idx, [r_begin])
+                        pipeline_cap = max(6, len(inflight_blocks))
+                    elif msg_id == MSG_PIECE and len(payload) >= 8:
+                        r_idx, r_begin = struct.unpack("!II", payload[:8])
+                        block = payload[8:]
+                        inflight_blocks.pop((r_idx, r_begin), None)
+                        self.store.store_block(r_idx, r_begin, block)
+                        blocks_transferred += 1
+                        self._mark_verified_seeder()
+                    elif msg_id == MSG_HAVE and len(payload) >= 4 and peer_pieces is not None:
+                        idx = struct.unpack("!I", payload[:4])[0]
+                        peer_pieces.add(idx)
+                    elif msg_id == MSG_EXTENDED:
+                        self._handle_extended(payload)
+                return b""
+            finally:
+                if inflight_blocks:
+                    rem = [b for (p, b) in inflight_blocks if p == piece_idx]
+                    if rem:
+                        self.store.unclaim_blocks(piece_idx, rem)
+                self.store.release_in_progress(piece_idx)
 
         plen = self.metadata.piece_size(piece_idx)
         piece_buf = bytearray(plen)
@@ -1498,9 +1577,9 @@ class PeerWorker(threading.Thread):
         next_req_idx = 0
         inflight = 0
 
-        # Sliding-window request pipeline
+        # Sliding-window request pipeline for small-piece torrents
         while received < plen:
-            while next_req_idx < len(offsets) and inflight < MAX_PIPELINE_BLOCKS:
+            while next_req_idx < len(offsets) and inflight < self._peer_max_pipeline:
                 begin = offsets[next_req_idx]
                 blen = min(BLOCK_SIZE, plen - begin)
                 _send_msg(sock, MSG_REQUEST, struct.pack("!III", piece_idx, begin, blen))
@@ -1510,15 +1589,21 @@ class PeerWorker(threading.Thread):
             msg_id, payload = self._read_message(sock)
             if msg_id == MSG_CHOKE:
                 return None
-            if msg_id == MSG_PIECE:
+            elif msg_id == MSG_REJECT_REQUEST and len(payload) >= 12:
+                r_idx, r_begin, _r_len = struct.unpack("!III", payload[:12])
+                if r_idx == piece_idx:
+                    inflight = max(0, inflight - 1)
+                    offsets.append(r_begin)
+            elif msg_id == MSG_PIECE and len(payload) >= 8:
                 r_idx, r_begin = struct.unpack("!II", payload[:8])
                 block = payload[8:]
                 if r_idx == piece_idx:
                     piece_buf[r_begin:r_begin + len(block)] = block
                     received += len(block)
                     inflight = max(0, inflight - 1)
-            elif msg_id == MSG_EXTENDED and len(payload) > 1 and payload[0] == 2:
-                self._handle_pex(payload[1:])
+                    self._mark_verified_seeder()
+            elif msg_id == MSG_EXTENDED:
+                self._handle_extended(payload)
         return bytes(piece_buf)
 
 
@@ -2054,6 +2139,9 @@ class TorrentVideoSession:
         self.web_seeds: List[str] = []
         self.stop_event = threading.Event()
         self.workers: List[threading.Thread] = []
+        self._workers_lock = threading.Lock()
+        self._spawned_peers: Set[Tuple[str, int]] = set()
+        self.verified_seeders: List[Tuple[str, int]] = []
         self.stream_server: Optional[VideoStreamServer] = None
         self._embedded_seeder: Optional[_EmbeddedFixtureSeeder] = None
 
@@ -2091,13 +2179,31 @@ class TorrentVideoSession:
             sliding_window_pieces=sliding_window_pieces,
         )
 
+    def _on_verified_seeder(self, peer_addr: Tuple[str, int]) -> None:
+        if peer_addr[0] == "127.0.0.1":
+            return
+        with self._workers_lock:
+            if peer_addr in self.verified_seeders:
+                self.verified_seeders.remove(peer_addr)
+            self.verified_seeders.insert(0, peer_addr)
+            if peer_addr not in self.explicit_peers:
+                self.explicit_peers.insert(0, peer_addr)
+            top_seeders = list(self.verified_seeders[:45])
+        try:
+            cache_dir = Path(__file__).resolve().parent / "fixtures" / ".metadata_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_peers_path = cache_dir / f"{self.metadata.info_hash.hex()}.peers"
+            cache_peers_path.write_text(json.dumps(top_seeders))
+        except Exception:
+            pass
+
     def _resolve_magnet(self, magnet_uri: str) -> Tuple[TorrentMetadata, List[Tuple[str, int]]]:
         """
         Resolve a Magnet URI via:
         1. Explicit `x.pe` peers or registered local fixture seeder
         2. Concurrent `tr=` HTTP & UDP (BEP 0015) tracker queries + public tracker list
         3. Mainline DHT (BEP 0005 `get_peers`)
-        4. Parallel BEP 0009/0010 (`ut_metadata`) + BEP 0011 (`ut_pex`) peer race across up to 75 peers
+        4. Parallel BEP 0009/0010 (`ut_metadata`) + BEP 0011 (`ut_pex`) peer race across up to 80 peers
         5. Automatic local BEP 0009/0003 Seeder fallback ONLY if zero peers on the internet have metadata
         """
         m_info = parse_magnet_uri(magnet_uri)
@@ -2126,35 +2232,31 @@ class TorrentVideoSession:
                     hp = (str(item[0]), int(item[1]))
                     if hp not in cached_peers:
                         cached_peers.append(hp)
+                        if hp not in self.verified_seeders:
+                            self.verified_seeders.append(hp)
                         if hp not in candidates:
                             candidates.append(hp)
             except Exception:
                 pass
 
-        # If we already have the SHA-1 verified info_dict cached on disk, load it immediately
-        # and combine cached fast seeders with a fast tracker refresh!
+        cached_meta: Optional[TorrentMetadata] = None
         if cache_info_path.exists() and hex_hash not in _GLOBAL_FIXTURE_SEEDERS:
             try:
                 raw_info = cache_info_path.read_bytes()
                 if hashlib.sha1(raw_info).digest() == m_info.info_hash:
                     info_dict = bdecode(raw_info)
-                    meta = TorrentMetadata.from_info_dict(
+                    cached_meta = TorrentMetadata.from_info_dict(
                         info_dict,
                         announce=trackers[0] if trackers else "",
                         announce_list=trackers,
                         override_info_hash=m_info.info_hash,
                     )
-                    if trackers:
-                        for tp in discover_peers_from_trackers(trackers, m_info.info_hash, self.peer_id, timeout=1.5):
-                            if tp not in candidates:
-                                candidates.append(tp)
-                    return meta, candidates
             except Exception:
-                pass
+                cached_meta = None
 
         if trackers and not (hex_hash in _GLOBAL_FIXTURE_SEEDERS):
             tracker_peers = discover_peers_from_trackers(
-                trackers, m_info.info_hash, self.peer_id, timeout=2.2
+                trackers, m_info.info_hash, self.peer_id, timeout=(1.4 if cached_meta else 2.2)
             )
             for tp in tracker_peers:
                 if tp not in candidates:
@@ -2166,25 +2268,40 @@ class TorrentVideoSession:
                 if dp not in candidates:
                     candidates.append(dp)
 
-        # Parallel BEP 0009/0010 ut_metadata + BEP 0011 ut_pex race across up to 80 peers
+        # If we already have SHA-1 verified metadata cached on disk, DO NOT open throwaway
+        # _probe_peer TCP sockets to seeders! Opening and immediately closing a probe socket burns
+        # the seeder's first-connection unchoke slot. Instead, return `cached_meta` immediately so
+        # `PeerWorker` opens the first and only persistent TCP connection to every seeder and receives
+        # both `MSG_UNCHOKE` and BEP 0011 `ut_pex` directly on the streaming socket!
+        if cached_meta is not None:
+            priority_peers: List[Tuple[str, int]] = []
+            for p in cached_peers + candidates:
+                if p not in priority_peers:
+                    priority_peers.append(p)
+            return cached_meta, priority_peers
+
+        # Parallel BEP 0009/0010 ut_metadata + BEP 0011 ut_pex race when metadata is not cached yet
         if candidates:
             found_info: List[Tuple[Dict[bytes, Any], Tuple[str, int], bytes]] = []
             pex_discovered: List[Tuple[str, int]] = []
             unchoked_peers: List[Tuple[str, int]] = []
             found_event = threading.Event()
-            probe_batch = candidates[:80]
+            probe_batch = candidates[:40]
             rem_peers = [len(probe_batch)]
             p_lock = threading.Lock()
 
             def _probe_peer(p_addr: Tuple[str, int]) -> None:
+                if found_event.is_set():
+                    return
                 local_pex: List[Tuple[str, int]] = []
                 local_unchoked: List[Tuple[str, int]] = []
+                ephemeral_peer_id = b"-qB4620-" + os.urandom(12)
                 try:
                     info_d = fetch_magnet_metadata_from_peer(
                         p_addr,
                         m_info.info_hash,
-                        self.peer_id,
-                        timeout=3.4,
+                        ephemeral_peer_id,
+                        timeout=3.2,
                         require_unchoke=False,
                         pex_out=local_pex,
                         unchoked_out=local_unchoked,
@@ -2211,14 +2328,7 @@ class TorrentVideoSession:
             for peer_addr in probe_batch:
                 threading.Thread(target=_probe_peer, args=(peer_addr,), daemon=True).start()
 
-            found_event.wait(timeout=3.6)
-            # If we got metadata quickly from an external swarm, give concurrent probes up to 0.45s
-            # to finish collecting MSG_UNCHOKE seeders and BEP 0011 ut_pex peer lists.
-            if found_info and not self.web_seeds and found_info[0][1][0] != "127.0.0.1":
-                wait_deadline = time.monotonic() + 0.45
-                while time.monotonic() < wait_deadline and len(unchoked_peers) < 3:
-                    time.sleep(0.05)
-
+            found_event.wait(timeout=3.4)
             if found_info:
                 info_dict, winning_peer, raw_b = found_info[0]
                 meta = TorrentMetadata.from_info_dict(
@@ -2228,15 +2338,17 @@ class TorrentVideoSession:
                     override_info_hash=m_info.info_hash,
                 )
                 with p_lock:
-                    priority_peers: List[Tuple[str, int]] = []
-                    for p in unchoked_peers + pex_discovered + [winning_peer] + candidates:
+                    priority_peers = []
+                    for p in unchoked_peers + cached_peers + pex_discovered + [winning_peer] + candidates:
                         if p not in priority_peers:
                             priority_peers.append(p)
                 if winning_peer[0] != "127.0.0.1" and hashlib.sha1(raw_b).digest() == m_info.info_hash:
                     try:
                         cache_dir.mkdir(parents=True, exist_ok=True)
                         cache_info_path.write_bytes(raw_b)
-                        cache_peers_path.write_text(json.dumps(priority_peers[:50]))
+                        cache_peers_path.write_text(
+                            json.dumps((unchoked_peers + cached_peers + [winning_peer] + pex_discovered)[:45])
+                        )
                     except Exception:
                         pass
                 return meta, priority_peers
@@ -2258,12 +2370,44 @@ class TorrentVideoSession:
 
         raise RuntimeError(f"Could not resolve magnet metadata for {m_info.info_hash.hex()}")
 
-    def _on_pex_peers(self, new_peers: List[Tuple[str, int]]) -> None:
+    def _replenish_workers(self) -> None:
+        """
+        Prunes finished/dead PeerWorker threads and spawns fresh PeerWorkers from `self.explicit_peers`
+        so the session never stalls at 0 active TCP peers when initial tracker IPs time out.
+        """
         if self.stop_event.is_set() or self.store.is_complete:
             return
-        for p in new_peers:
-            if p not in self.explicit_peers and len(self.workers) < 110:
-                self.explicit_peers.append(p)
+        with self._workers_lock:
+            self.workers = [w for w in self.workers if w.is_alive()]
+            live_peer_workers = [w for w in self.workers if isinstance(w, PeerWorker)]
+            active_addrs = {w.peer_addr for w in live_peer_workers}
+            connected_count = sum(1 for w in live_peer_workers if getattr(w, "connected", False))
+
+            target_live = 95
+            slots = target_live - len(live_peer_workers)
+            if slots <= 0:
+                return
+
+            # Prioritize verified seeders first, then non-6881 client ports, then remaining swarm peers
+            verified_set = set(self.verified_seeders)
+            untried = [
+                p for p in self.explicit_peers
+                if p not in active_addrs and (p in verified_set or p not in self._spawned_peers)
+            ]
+            if not untried and connected_count < 8 and self.explicit_peers:
+                # All swarm candidates were tried once and few connected; reset _spawned_peers to re-sweep
+                self._spawned_peers = set(active_addrs)
+                untried = [p for p in self.explicit_peers if p not in active_addrs]
+
+            untried.sort(
+                key=lambda hp: (
+                    0 if hp[0] == "127.0.0.1"
+                    else (1 if hp in verified_set else (2 if hp[1] not in (6881, 6882, 6889) else 3))
+                )
+            )
+
+            for p in untried[:slots]:
+                self._spawned_peers.add(p)
                 worker = PeerWorker(
                     peer_addr=p,
                     metadata=self.metadata,
@@ -2271,40 +2415,62 @@ class TorrentVideoSession:
                     peer_id=self.peer_id,
                     stop_event=self.stop_event,
                     on_pex_peers=self._on_pex_peers,
+                    on_verified_seeder=self._on_verified_seeder,
                 )
                 worker.start()
                 self.workers.append(worker)
 
+    def _on_pex_peers(self, new_peers: List[Tuple[str, int]]) -> None:
+        if self.stop_event.is_set() or self.store.is_complete:
+            return
+        with self._workers_lock:
+            for p in new_peers:
+                if p not in self.explicit_peers:
+                    # Insert non-6881 PEX peers near the front so _replenish_workers picks them up immediately
+                    if p[1] not in (6881, 6882, 6889):
+                        insert_idx = min(len(self.explicit_peers), len(self.verified_seeders) + 5)
+                        self.explicit_peers.insert(insert_idx, p)
+                    else:
+                        self.explicit_peers.append(p)
+        self._replenish_workers()
+
     def _background_swarm_expander(self) -> None:
-        """Continuously discover fresh seeders from trackers & DHT while video is streaming."""
+        """
+        1. Every 1.5s: prunes dead PeerWorker threads and spawns replacements from the 300+ swarm pool.
+        2. Every 12s: queries HTTP/UDP trackers & DHT for new peers joining the swarm.
+        """
+        last_tracker_poll = time.monotonic()
         while not self.stop_event.is_set() and not self.store.is_complete:
             try:
                 if self.metadata.info_hash.hex() in _GLOBAL_FIXTURE_SEEDERS:
                     return
-                trackers = list(DEFAULT_PUBLIC_TRACKERS)
-                for mtr in self.metadata.announce_list:
-                    if mtr not in trackers:
-                        trackers.append(mtr)
-                fresh = discover_peers_from_trackers(
-                    trackers,
-                    self.metadata.info_hash,
-                    self.peer_id,
-                    left=max(0, self.target_file.length - self.store.bytes_downloaded),
-                    timeout=2.5,
-                )
-                if fresh:
-                    self._on_pex_peers(fresh)
-                dht_fresh = query_dht_for_peers(self.metadata.info_hash, timeout=2.5)
-                if dht_fresh:
-                    self._on_pex_peers(dht_fresh)
+                self._replenish_workers()
+                now = time.monotonic()
+                if (now - last_tracker_poll) >= 12.0:
+                    last_tracker_poll = now
+                    trackers = list(DEFAULT_PUBLIC_TRACKERS)
+                    for mtr in self.metadata.announce_list:
+                        if mtr not in trackers:
+                            trackers.append(mtr)
+                    fresh = discover_peers_from_trackers(
+                        trackers,
+                        self.metadata.info_hash,
+                        self.peer_id,
+                        left=max(0, self.target_file.length - self.store.bytes_downloaded),
+                        timeout=2.2,
+                    )
+                    if fresh:
+                        self._on_pex_peers(fresh)
+                    dht_fresh = query_dht_for_peers(self.metadata.info_hash, timeout=2.2)
+                    if dht_fresh:
+                        self._on_pex_peers(dht_fresh)
             except Exception:
                 pass
-            if self.stop_event.wait(timeout=12.0):
+            if self.stop_event.wait(timeout=1.5):
                 break
 
     def start_swarm(self) -> None:
         discovered = list(self.explicit_peers)
-        # Only block on tracker discovery if we don't already have peers from _resolve_magnet
         if not discovered and self.metadata.announce_list and self.metadata.info_hash.hex() not in _GLOBAL_FIXTURE_SEEDERS:
             for p in discover_peers_from_trackers(
                 self.metadata.announce_list,
@@ -2330,6 +2496,11 @@ class TorrentVideoSession:
                 )
                 discovered.append((self._embedded_seeder.host, self._embedded_seeder.port))
 
+        with self._workers_lock:
+            for p in discovered:
+                if p not in self.explicit_peers:
+                    self.explicit_peers.append(p)
+
         # 1. Start 8 Persistent HTTP/1.1 Keep-Alive WebSeed Workers (BEP 0019) immediately
         for ws_url in self.web_seeds:
             for _ in range(8):
@@ -2340,22 +2511,13 @@ class TorrentVideoSession:
                     stop_event=self.stop_event,
                 )
                 ws_worker.start()
-                self.workers.append(ws_worker)
+                with self._workers_lock:
+                    self.workers.append(ws_worker)
 
-        # 2. Start up to 65 concurrent TCP Peer Workers (BEP 0003 + BEP 0011 PEX)
-        for peer_addr in discovered[:65]:
-            worker = PeerWorker(
-                peer_addr=peer_addr,
-                metadata=self.metadata,
-                store=self.store,
-                peer_id=self.peer_id,
-                stop_event=self.stop_event,
-                on_pex_peers=self._on_pex_peers,
-            )
-            worker.start()
-            self.workers.append(worker)
+        # 2. Spawn initial wave of up to 95 prioritized TCP Peer Workers (BEP 0003 + BEP 0011 PEX)
+        self._replenish_workers()
 
-        # 3. Launch continuous background tracker + DHT peer discovery
+        # 3. Launch continuous 1.5s worker replenisher + 12s background tracker/DHT expander
         threading.Thread(target=self._background_swarm_expander, daemon=True).start()
 
     def start_http_stream(self, host: str = "127.0.0.1", port: int = 0) -> str:
