@@ -362,17 +362,24 @@ class SparseVideoPieceStore:
         self.completed_pieces: Set[int] = set()
         self.in_progress_pieces: Set[int] = set()
         self.in_progress_since: Dict[int, float] = {}
+        self._piece_buffers: Dict[int, bytearray] = {}
+        self._received_blocks: Dict[int, Set[int]] = {}
+        self._claimed_blocks: Dict[int, Dict[int, float]] = {}
         self._priority_cursor: int = self.first_piece
         self._urgent_pieces: List[int] = []
         self.bytes_downloaded: int = 0
         self.started_at: float = time.monotonic()
         self._speed_samples: List[Tuple[float, int]] = []
 
-        # Pre-prioritize first 4 pieces (header + initial frames) and last piece (MP4 moov atom)
-        for p in range(self.first_piece, min(self.last_piece + 1, self.first_piece + 4)):
-            self._urgent_pieces.append(p)
-        if self.last_piece not in self._urgent_pieces:
-            self._urgent_pieces.append(self.last_piece)
+        # For large pieces (>= 1 MiB, e.g. 8 MiB MKV torrents), focus 100% of initial swarm bandwidth
+        # on Piece 0 so the first video cluster streams in < 1s; for small pieces, pre-prioritize first 4 + last.
+        if self.metadata.piece_length >= 1048576:
+            self._urgent_pieces.append(self.first_piece)
+        else:
+            for p in range(self.first_piece, min(self.last_piece + 1, self.first_piece + 4)):
+                self._urgent_pieces.append(p)
+            if self.last_piece not in self._urgent_pieces:
+                self._urgent_pieces.append(self.last_piece)
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = os.open(
@@ -398,7 +405,11 @@ class SparseVideoPieceStore:
         with self._lock:
             if not self.required_pieces:
                 return 1.0
-            return len(self.completed_pieces & self.required_pieces) / len(self.required_pieces)
+            if self.required_pieces.issubset(self.completed_pieces):
+                return 1.0
+            by_pieces = len(self.completed_pieces & self.required_pieces) / len(self.required_pieces)
+            by_bytes = min(0.9999, self.bytes_downloaded / max(1, self.target_file.length))
+            return max(by_pieces, by_bytes)
 
     def piece_states_snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -408,7 +419,7 @@ class SparseVideoPieceStore:
             for p in range(self.first_piece, self.last_piece + 1):
                 if p in self.completed_pieces:
                     states.append("done")
-                elif p in self.in_progress_pieces:
+                elif p in self.in_progress_pieces or p in self._received_blocks:
                     states.append("active")
                 elif p in urgent_set:
                     states.append("urgent")
@@ -423,10 +434,13 @@ class SparseVideoPieceStore:
             else:
                 elapsed = max(0.001, now - self.started_at)
                 speed_bps = int(self.bytes_downloaded / elapsed) if not self.required_pieces.issubset(self.completed_pieces) else 0
+            by_pieces = len(self.completed_pieces & self.required_pieces) / max(1, len(self.required_pieces))
+            by_bytes = min(0.9999, self.bytes_downloaded / max(1, self.target_file.length))
+            prog = 1.0 if self.required_pieces.issubset(self.completed_pieces) else round(max(by_pieces, by_bytes), 4)
             return {
                 "total_pieces": len(self.required_pieces),
                 "completed_pieces": len(self.completed_pieces & self.required_pieces),
-                "progress": round(len(self.completed_pieces & self.required_pieces) / max(1, len(self.required_pieces)), 4),
+                "progress": prog,
                 "complete": self.required_pieces.issubset(self.completed_pieces),
                 "size": self.target_file.length,
                 "bytes_downloaded": self.bytes_downloaded,
@@ -442,11 +456,12 @@ class SparseVideoPieceStore:
 
     def prioritize_byte_range(self, start_byte: int, end_byte: int) -> None:
         start_piece = self.piece_for_file_offset(start_byte)
-        end_piece = self.piece_for_file_offset(min(end_byte, start_byte + self.sliding_window_pieces * self.metadata.piece_length))
+        window_pieces = 2 if self.metadata.piece_length >= 1048576 else self.sliding_window_pieces
+        end_piece = self.piece_for_file_offset(min(end_byte, start_byte + window_pieces * self.metadata.piece_length))
         with self._lock:
             self._priority_cursor = start_piece
             new_urgent = [
-                p for p in range(start_piece, min(self.last_piece + 1, end_piece + self.sliding_window_pieces))
+                p for p in range(start_piece, min(self.last_piece + 1, end_piece + window_pieces))
                 if p not in self.completed_pieces
             ]
             for p in self._urgent_pieces:
@@ -458,6 +473,8 @@ class SparseVideoPieceStore:
     def next_piece_to_download(self, peer_bitfield: Optional[Set[int]] = None, allow_steal_after: float = 0.7) -> Optional[int]:
         with self._lock:
             now = time.monotonic()
+            # When pieces are >= 512 KiB, let ALL peers swarm-stripe the urgent piece simultaneously!
+            cooperative_large = self.metadata.piece_length >= 524288
 
             def eligible(p: int, can_steal: bool = False) -> bool:
                 if p not in self.required_pieces or p in self.completed_pieces:
@@ -465,6 +482,8 @@ class SparseVideoPieceStore:
                 if peer_bitfield is not None and p not in peer_bitfield:
                     return False
                 if p in self.in_progress_pieces:
+                    if cooperative_large and p in self._urgent_pieces[:2]:
+                        return True
                     if can_steal and (now - self.in_progress_since.get(p, now)) >= allow_steal_after:
                         return True
                     return False
@@ -473,11 +492,11 @@ class SparseVideoPieceStore:
             while self._urgent_pieces and self._urgent_pieces[0] in self.completed_pieces:
                 self._urgent_pieces.pop(0)
 
-            # 1. Unclaimed urgent pieces first
+            # 1. Unclaimed (or cooperative large) urgent pieces first
             for p in self._urgent_pieces:
                 if eligible(p, can_steal=False):
                     self.in_progress_pieces.add(p)
-                    self.in_progress_since[p] = now
+                    self.in_progress_since.setdefault(p, now)
                     return p
 
             # 2. Steal slow in-progress urgent pieces (Endgame / Straggler protection for streaming)
@@ -507,6 +526,129 @@ class SparseVideoPieceStore:
                     return p
 
             return None
+
+    def next_block_batch_for_piece(self, piece_index: int, batch_size: int = 16) -> List[Tuple[int, int]]:
+        """
+        Cooperative block allocator for large pieces: multiple peers claim non-overlapping
+        16 KiB blocks of the same piece in sequential order, stealing straggler blocks after 1.2s.
+        """
+        with self._lock:
+            if piece_index in self.completed_pieces:
+                return []
+            plen = self.metadata.piece_size(piece_index)
+            received = self._received_blocks.setdefault(piece_index, set())
+            claimed = self._claimed_blocks.setdefault(piece_index, {})
+            now = time.monotonic()
+            out: List[Tuple[int, int]] = []
+
+            # Pass 1: unclaimed blocks in sequential order
+            for begin in range(0, plen, BLOCK_SIZE):
+                if begin in received:
+                    continue
+                if begin not in claimed:
+                    claimed[begin] = now
+                    out.append((begin, min(BLOCK_SIZE, plen - begin)))
+                    if len(out) >= batch_size:
+                        return out
+
+            # Pass 2: steal straggler blocks claimed > 1.2s ago
+            for begin in range(0, plen, BLOCK_SIZE):
+                if begin in received:
+                    continue
+                if (now - claimed.get(begin, 0.0)) >= 1.2:
+                    claimed[begin] = now
+                    out.append((begin, min(BLOCK_SIZE, plen - begin)))
+                    if len(out) >= batch_size:
+                        return out
+
+            return out
+
+    def store_block(self, piece_index: int, begin: int, block: bytes) -> bool:
+        """
+        Store a single 16 KiB block immediately to the sparse file (`os.pwrite`) so HTTP Range
+        streaming can read incoming video clusters in real time without waiting for an entire 8 MiB piece.
+        Once all blocks of `piece_index` arrive, verifies the full piece SHA-1 hash.
+        """
+        plen = self.metadata.piece_size(piece_index)
+        block_global_start = piece_index * self.metadata.piece_length + begin
+        block_global_end = block_global_start + len(block)
+
+        file_global_start = self.target_file.offset
+        file_global_end = file_global_start + self.target_file.length
+
+        overlap_start = max(block_global_start, file_global_start)
+        overlap_end = min(block_global_end, file_global_end)
+
+        full_buf: Optional[bytes] = None
+        with self._lock:
+            if piece_index in self.completed_pieces:
+                return True
+
+            if overlap_start < overlap_end and self._fd >= 0:
+                slice_start = overlap_start - block_global_start
+                slice_end = overlap_end - block_global_start
+                file_write_offset = overlap_start - file_global_start
+                os.pwrite(self._fd, block[slice_start:slice_end], file_write_offset)
+
+            pbuf = self._piece_buffers.get(piece_index)
+            if pbuf is None:
+                pbuf = bytearray(plen)
+                self._piece_buffers[piece_index] = pbuf
+            pbuf[begin:begin + len(block)] = block
+
+            rec = self._received_blocks.setdefault(piece_index, set())
+            if begin not in rec:
+                rec.add(begin)
+                self.bytes_downloaded += len(block)
+                self._speed_samples.append((time.monotonic(), len(block)))
+
+            total_blocks = (plen + BLOCK_SIZE - 1) // BLOCK_SIZE
+            if len(rec) >= total_blocks:
+                full_buf = bytes(pbuf)
+            else:
+                self._lock.notify_all()
+
+        if full_buf is not None:
+            if hashlib.sha1(full_buf).digest() == self.metadata.piece_hashes[piece_index]:
+                with self._lock:
+                    self.completed_pieces.add(piece_index)
+                    self.in_progress_pieces.discard(piece_index)
+                    self.in_progress_since.pop(piece_index, None)
+                    self._piece_buffers.pop(piece_index, None)
+                    self._received_blocks.pop(piece_index, None)
+                    self._claimed_blocks.pop(piece_index, None)
+                    self._lock.notify_all()
+                return True
+            else:
+                with self._lock:
+                    self._piece_buffers.pop(piece_index, None)
+                    self._received_blocks.pop(piece_index, None)
+                    self._claimed_blocks.pop(piece_index, None)
+                    self.in_progress_pieces.discard(piece_index)
+                    self._lock.notify_all()
+                return False
+        return True
+
+    def _has_byte_range_blocks_locked(self, file_offset: int, length: int) -> bool:
+        global_start = self.target_file.offset + file_offset
+        global_end = global_start + length - 1
+        start_p = global_start // self.metadata.piece_length
+        end_p = global_end // self.metadata.piece_length
+        for p in range(start_p, end_p + 1):
+            if p in self.completed_pieces:
+                continue
+            rec = self._received_blocks.get(p)
+            if not rec:
+                return False
+            p_start = p * self.metadata.piece_length
+            ov_s = max(global_start, p_start) - p_start
+            ov_e = min(global_end, p_start + self.metadata.piece_size(p) - 1) - p_start
+            first_blk = (ov_s // BLOCK_SIZE) * BLOCK_SIZE
+            last_blk = (ov_e // BLOCK_SIZE) * BLOCK_SIZE
+            for b in range(first_blk, last_blk + 1, BLOCK_SIZE):
+                if b not in rec:
+                    return False
+        return True
 
     def next_piece_batch_to_download(self, max_batch: int = 4) -> List[int]:
         """
@@ -562,15 +704,21 @@ class SparseVideoPieceStore:
                 os.pwrite(self._fd, data[slice_start:slice_end], file_write_offset)
 
             if piece_index not in self.completed_pieces:
-                self.bytes_downloaded += len(data)
-                self._speed_samples.append((time.monotonic(), len(data)))
+                already_counted = len(self._received_blocks.get(piece_index, set())) * BLOCK_SIZE
+                delta = max(0, len(data) - already_counted)
+                if delta > 0:
+                    self.bytes_downloaded += delta
+                    self._speed_samples.append((time.monotonic(), delta))
             self.in_progress_pieces.discard(piece_index)
             self.in_progress_since.pop(piece_index, None)
+            self._piece_buffers.pop(piece_index, None)
+            self._received_blocks.pop(piece_index, None)
+            self._claimed_blocks.pop(piece_index, None)
             self.completed_pieces.add(piece_index)
             self._lock.notify_all()
         return True
 
-    def read_video_bytes(self, file_offset: int, length: int, timeout: float = 30.0) -> bytes:
+    def read_video_bytes(self, file_offset: int, length: int, timeout: float = 45.0) -> bytes:
         if file_offset >= self.target_file.length or length <= 0:
             return b""
         length = min(length, self.target_file.length - file_offset)
@@ -584,15 +732,34 @@ class SparseVideoPieceStore:
 
         deadline = time.monotonic() + timeout
         with self._lock:
-            while not needed.issubset(self.completed_pieces):
+            while not (
+                needed.issubset(self.completed_pieces)
+                or self._has_byte_range_blocks_locked(file_offset, length)
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     missing = sorted(needed - self.completed_pieces)
                     raise TimeoutError(
                         f"Timed out waiting for pieces {missing} (offset={file_offset}, len={length})"
                     )
-                self._lock.wait(timeout=min(0.25, remaining))
-            return os.pread(self._fd, length, file_offset)
+                self._lock.wait(timeout=min(0.2, remaining))
+            data = os.pread(self._fd, length, file_offset)
+            # If streaming an incomplete Matroska (.mkv) file from offset 0, mask SeekID=Cues (1c53bb6b)
+            # in SeekHead so the video player immediately plays Cluster 0 (at byte ~816) instead of
+            # jumping to the end of a multi-GB file before decoding frame 1.
+            if (
+                file_offset == 0
+                and len(data) >= 512
+                and data[:4] == b"\x1a\x45\xdf\xa3"
+                and not self.required_pieces.issubset(self.completed_pieces)
+            ):
+                cues_pattern = b"\x53\xab\x84\x1c\x53\xbb\x6b"
+                idx = data[:512].find(cues_pattern)
+                if idx != -1:
+                    patched = bytearray(data)
+                    patched[idx:idx + 7] = b"\x53\xab\x84\xec\x53\xbb\x6b"
+                    data = bytes(patched)
+            return data
 
 
 # ============================================================================
@@ -734,11 +901,24 @@ DEAD_TRACKER_DOMAINS = (
     "internetwarriors.",
     "pirateparty.",
     "i2p.rocks",
-    "arenabg.",
     "cyberia.is",
     "tiny-vps.com",
     "ip-51-68-199.eu",
 )
+
+
+def _extract_compact_peers(blob: bytes) -> List[Tuple[str, int]]:
+    out: List[Tuple[str, int]] = []
+    if not isinstance(blob, bytes):
+        return out
+    for i in range(0, len(blob), 6):
+        chunk = blob[i:i + 6]
+        if len(chunk) == 6:
+            ip = socket.inet_ntoa(chunk[:4])
+            pport = struct.unpack("!H", chunk[4:6])[0]
+            if pport > 0 and not ip.startswith(("0.", "127.")):
+                out.append((ip, pport))
+    return out
 
 
 def discover_peers_from_trackers(
@@ -746,27 +926,47 @@ def discover_peers_from_trackers(
     info_hash: bytes,
     peer_id: bytes,
     left: int = 1048576,
-    timeout: float = 1.2,
+    timeout: float = 1.6,
 ) -> List[Tuple[str, int]]:
     """
-    Query up to 6 fast HTTP/UDP trackers concurrently using daemon threads so dead DNS domains
-    (like `9.rarbg.to` or `tracker.coppersurfer.tk`) never block resolution or interpreter exit.
+    Query up to 14 fast HTTP/UDP trackers concurrently using daemon threads so dead DNS domains
+    never block resolution, and prioritize non-6881 client ports where active seeders listen.
     """
     if not trackers:
         return []
 
-    filtered = [
-        tr for tr in trackers
-        if not any(dead in tr.lower() for dead in DEAD_TRACKER_DOMAINS)
-    ]
+    filtered = []
+    for tr in trackers:
+        if any(dead in tr.lower() for dead in DEAD_TRACKER_DOMAINS):
+            continue
+        # Normalize UDP trackers missing `/announce` suffix
+        if tr.startswith("udp://") and "/announce" not in tr:
+            tr = tr.rstrip("/") + "/announce"
+        if tr not in filtered:
+            filtered.append(tr)
+
     if not filtered:
         filtered = list(DEFAULT_PUBLIC_TRACKERS)
 
-    fast_keywords = ("127.0.0.1", "opentrackr", "stealth.si", "torrent.eu.org", "openbittorrent", "exodus.desync")
+    fast_keywords = (
+        "127.0.0.1",
+        "renfei.net",
+        "arenabg.com",
+        "dler.org",
+        "dler.com",
+        "qu.ax",
+        "demonii.com",
+        "explodie.org",
+        "opentrackr",
+        "stealth.si",
+        "torrent.eu.org",
+        "openbittorrent",
+        "exodus.desync",
+    )
     ordered_trackers = sorted(
         filtered,
         key=lambda t: 0 if any(k in t for k in fast_keywords) else 1,
-    )[:6]
+    )[:14]
 
     discovered: List[Tuple[str, int]] = []
     lock = threading.Lock()
@@ -791,15 +991,20 @@ def discover_peers_from_trackers(
         finally:
             with lock:
                 remaining[0] -= 1
-                if remaining[0] <= 0 or len(discovered) >= 40:
+                if remaining[0] <= 0 or len(discovered) >= 220:
                     done_event.set()
 
     for tr in ordered_trackers:
         threading.Thread(target=_worker, args=(tr,), daemon=True).start()
 
-    done_event.wait(timeout=timeout + 0.2)
+    done_event.wait(timeout=timeout + 0.25)
     with lock:
-        return list(discovered)
+        # Prioritize non-6881 ephemeral/configured client ports (e.g. qBittorrent/BitTorrent seeders)
+        # ahead of generic :6881 DHT crawler/NAT placeholder entries.
+        return sorted(
+            discovered,
+            key=lambda hp: (0 if hp[0] == "127.0.0.1" else (1 if hp[1] not in (6881, 6882, 6889) else 2)),
+        )
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -821,21 +1026,22 @@ def fetch_magnet_metadata_from_peer(
     peer_addr: Tuple[str, int],
     info_hash: bytes,
     peer_id: bytes,
-    timeout: float = 4.0,
+    timeout: float = 3.2,
     require_unchoke: bool = False,
+    pex_out: Optional[List[Tuple[str, int]]] = None,
+    unchoked_out: Optional[List[Tuple[str, int]]] = None,
 ) -> Optional[Dict[bytes, Any]]:
     """
     Resolve `.torrent` info dictionary from a peer using BEP 0010 (Extension Protocol)
-    and BEP 0009 (`ut_metadata`).
-    If `require_unchoke` is True (used for external swarms without WebSeeds), also sends
-    `MSG_INTERESTED` and verifies that the peer actually unchokes (`MSG_UNCHOKE`) rather than
-    being a permanently-choked fake-torrent metadata bot.
+    and BEP 0009 (`ut_metadata`), while also harvesting BEP 0011 (`ut_pex`) peers and
+    checking whether the peer unchokes (`MSG_UNCHOKE`).
     """
-    with socket.create_connection(peer_addr, timeout=timeout) as sock:
+    with socket.create_connection(peer_addr, timeout=min(2.2, timeout)) as sock:
         sock.settimeout(timeout)
         pstr = b"BitTorrent protocol"
         reserved = bytearray(8)
-        reserved[5] = 0x10
+        reserved[5] = 0x10  # BEP 0010 Extension Protocol
+        reserved[7] = 0x04  # BEP 0006 Fast Extension
         handshake = struct.pack("!B", len(pstr)) + pstr + bytes(reserved) + info_hash + peer_id
         sock.sendall(handshake)
 
@@ -845,10 +1051,9 @@ def fetch_magnet_metadata_from_peer(
         if (resp[25] & 0x10) == 0:
             return None
 
-        ext_hs = bencode({b"m": {b"ut_metadata": 1}})
+        ext_hs = bencode({b"m": {b"ut_metadata": 1, b"ut_pex": 2}})
         _send_msg(sock, MSG_EXTENDED, struct.pack("!B", 0) + ext_hs)
-        if require_unchoke and peer_addr[0] != "127.0.0.1":
-            _send_msg(sock, MSG_INTERESTED)
+        _send_msg(sock, MSG_INTERESTED)
 
         peer_ut_metadata_id: Optional[int] = None
         metadata_size: Optional[int] = None
@@ -868,6 +1073,8 @@ def fetch_magnet_metadata_from_peer(
 
             if mid == MSG_UNCHOKE:
                 unchoked = True
+                if unchoked_out is not None and peer_addr not in unchoked_out:
+                    unchoked_out.append(peer_addr)
                 if parsed_info is not None:
                     return parsed_info
             elif mid == MSG_EXTENDED and len(payload) >= 1:
@@ -885,6 +1092,14 @@ def fetch_magnet_metadata_from_peer(
                         for idx in range(num_meta_pieces):
                             req_dict = bencode({b"msg_type": 0, b"piece": idx})
                             _send_msg(sock, MSG_EXTENDED, struct.pack("!B", peer_ut_metadata_id) + req_dict)
+                elif ext_id == 2 and pex_out is not None:
+                    try:
+                        pex_dict = bdecode(ext_body)
+                        for np in _extract_compact_peers(pex_dict.get(b"added", b"")):
+                            if np not in pex_out:
+                                pex_out.append(np)
+                    except Exception:
+                        pass
                 elif ext_id == 1:
                     header_dict, piece_slice = bdecode_prefix(ext_body)
                     if header_dict.get(b"msg_type") == 1:
@@ -896,22 +1111,23 @@ def fetch_magnet_metadata_from_peer(
                                 parsed_info = bdecode(full_info_bytes)
                                 if unchoked:
                                     return parsed_info
-                                # Give the peer up to 0.9s to send MSG_UNCHOKE
-                                sock.settimeout(0.9)
+                                sock.settimeout(0.6)
                             else:
                                 return None
-    return None
+    return parsed_info
 
 
 # ============================================================================
-# 5. BitTorrent Peer Worker (BEP 0003)
+# 5. BitTorrent Peer Worker (BEP 0003 + BEP 0006 + BEP 0010/0011 PEX)
 # ============================================================================
 
-MAX_PIPELINE_BLOCKS = 16  # Max 16 in-flight 16 KiB block requests per peer (prevents queue drops)
+MAX_PIPELINE_BLOCKS = 24  # Max 24 in-flight 16 KiB block requests per peer (384 KiB window)
+MSG_HAVE_ALL = 14
+MSG_HAVE_NONE = 15
 
 
 class PeerWorker(threading.Thread):
-    """Downloads pieces from a single BitTorrent peer using BEP 0003 wire protocol."""
+    """Downloads pieces/blocks from a single BitTorrent peer using BEP 0003 wire protocol."""
 
     def __init__(
         self,
@@ -920,6 +1136,7 @@ class PeerWorker(threading.Thread):
         store: SparseVideoPieceStore,
         peer_id: bytes,
         stop_event: threading.Event,
+        on_pex_peers: Optional[ Any ] = None,
     ) -> None:
         super().__init__(daemon=True)
         self.peer_addr = peer_addr
@@ -927,21 +1144,38 @@ class PeerWorker(threading.Thread):
         self.store = store
         self.peer_id = peer_id
         self.stop_event = stop_event
+        self.on_pex_peers = on_pex_peers
         self.connected = False
 
     def run(self) -> None:
-        while not self.stop_event.is_set() and not self.store.is_complete:
+        attempts = 0
+        while not self.stop_event.is_set() and not self.store.is_complete and attempts < 3:
             try:
                 self._session()
             except Exception:
                 self.connected = False
-                time.sleep(0.2)
+                attempts += 1
+                time.sleep(0.25)
+
+    def _handle_pex(self, ext_body: bytes) -> None:
+        if self.on_pex_peers is None:
+            return
+        try:
+            pex_dict = bdecode(ext_body)
+            new_peers = _extract_compact_peers(pex_dict.get(b"added", b""))
+            if new_peers:
+                self.on_pex_peers(new_peers)
+        except Exception:
+            pass
 
     def _session(self) -> None:
-        with socket.create_connection(self.peer_addr, timeout=5.0) as sock:
-            sock.settimeout(5.0)
+        with socket.create_connection(self.peer_addr, timeout=3.5) as sock:
+            sock.settimeout(4.5)
             pstr = b"BitTorrent protocol"
-            handshake = struct.pack("!B", len(pstr)) + pstr + (b"\x00" * 8) + self.metadata.info_hash + self.peer_id
+            reserved = bytearray(8)
+            reserved[5] = 0x10  # BEP 0010 Extension Protocol
+            reserved[7] = 0x04  # BEP 0006 Fast Extension
+            handshake = struct.pack("!B", len(pstr)) + pstr + bytes(reserved) + self.metadata.info_hash + self.peer_id
             sock.sendall(handshake)
 
             resp = _recv_exact(sock, 68)
@@ -949,6 +1183,9 @@ class PeerWorker(threading.Thread):
                 raise ConnectionError("Invalid peer handshake")
 
             self.connected = True
+            if resp[25] & 0x10:
+                ext_hs = bencode({b"m": {b"ut_metadata": 1, b"ut_pex": 2}})
+                _send_msg(sock, MSG_EXTENDED, struct.pack("!B", 0) + ext_hs)
             _send_msg(sock, MSG_INTERESTED)
 
             peer_choking = True
@@ -961,22 +1198,29 @@ class PeerWorker(threading.Thread):
                         peer_choking = False
                     elif msg_id == MSG_CHOKE:
                         peer_choking = True
-                    elif msg_id == MSG_HAVE:
+                    elif msg_id == MSG_HAVE and len(payload) >= 4:
                         idx = struct.unpack("!I", payload[:4])[0]
                         peer_pieces.add(idx)
                     elif msg_id == MSG_BITFIELD:
                         peer_pieces = self._parse_bitfield(payload)
+                    elif msg_id == MSG_HAVE_ALL:
+                        peer_pieces = set(range(self.metadata.num_pieces))
+                    elif msg_id == MSG_HAVE_NONE:
+                        peer_pieces = set()
+                    elif msg_id == MSG_EXTENDED and len(payload) > 1 and payload[0] == 2:
+                        self._handle_pex(payload[1:])
                     continue
 
                 piece_idx = self.store.next_piece_to_download(peer_pieces)
                 if piece_idx is None:
-                    time.sleep(0.05)
+                    time.sleep(0.04)
                     continue
 
                 try:
                     piece_data = self._download_piece(sock, piece_idx)
                     if piece_data is not None:
-                        self.store.verify_and_store_piece(piece_idx, piece_data)
+                        if len(piece_data) > 0:
+                            self.store.verify_and_store_piece(piece_idx, piece_data)
                     else:
                         peer_choking = True
                         self.store.release_in_progress(piece_idx)
@@ -1004,6 +1248,33 @@ class PeerWorker(threading.Thread):
             return msg_id, payload
 
     def _download_piece(self, sock: socket.socket, piece_idx: int) -> Optional[bytes]:
+        if self.metadata.piece_length >= 524288:
+            # Cooperative sub-piece 16 KiB block streaming for large pieces (e.g. 8 MiB MKV):
+            # All connected peers simultaneously claim non-overlapping 16 KiB blocks of the
+            # urgent piece and write every block immediately to disk (`store.store_block`).
+            inflight = 0
+            while not self.stop_event.is_set() and piece_idx not in self.store.completed_pieces:
+                if inflight < MAX_PIPELINE_BLOCKS:
+                    batch = self.store.next_block_batch_for_piece(
+                        piece_idx, batch_size=(MAX_PIPELINE_BLOCKS - inflight)
+                    )
+                    for begin, blen in batch:
+                        _send_msg(sock, MSG_REQUEST, struct.pack("!III", piece_idx, begin, blen))
+                        inflight += 1
+                if inflight == 0:
+                    break
+                msg_id, payload = self._read_message(sock)
+                if msg_id == MSG_CHOKE:
+                    return None
+                elif msg_id == MSG_PIECE and len(payload) >= 8:
+                    r_idx, r_begin = struct.unpack("!II", payload[:8])
+                    block = payload[8:]
+                    inflight = max(0, inflight - 1)
+                    self.store.store_block(r_idx, r_begin, block)
+                elif msg_id == MSG_EXTENDED and len(payload) > 1 and payload[0] == 2:
+                    self._handle_pex(payload[1:])
+            return b""
+
         plen = self.metadata.piece_size(piece_idx)
         piece_buf = bytearray(plen)
         received = 0
@@ -1011,7 +1282,7 @@ class PeerWorker(threading.Thread):
         next_req_idx = 0
         inflight = 0
 
-        # Sliding-window request pipeline (max 16 blocks in flight at once)
+        # Sliding-window request pipeline
         while received < plen:
             while next_req_idx < len(offsets) and inflight < MAX_PIPELINE_BLOCKS:
                 begin = offsets[next_req_idx]
@@ -1030,6 +1301,8 @@ class PeerWorker(threading.Thread):
                     piece_buf[r_begin:r_begin + len(block)] = block
                     received += len(block)
                     inflight = max(0, inflight - 1)
+            elif msg_id == MSG_EXTENDED and len(payload) > 1 and payload[0] == 2:
+                self._handle_pex(payload[1:])
         return bytes(piece_buf)
 
 
@@ -1216,6 +1489,13 @@ def get_default_fixture_magnet() -> str:
 
 
 DEFAULT_PUBLIC_TRACKERS = [
+    "http://tracker.renfei.net:8080/announce",
+    "http://p4p.arenabg.com:1337/announce",
+    "http://tracker.dler.org:6969/announce",
+    "http://tracker.dler.com:6969/announce",
+    "http://tracker.qu.ax:6969/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://explodie.org:6969/announce",
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.stealth.si:80/announce",
     "udp://tracker.torrent.eu.org:451/announce",
@@ -1334,6 +1614,15 @@ ONLINE_MAGNET_PRESETS: Dict[str, str] = {
         "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
         "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
         "&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F"
+    ),
+    "odyssey": (
+        "magnet:?xt=urn:btih:48AEB057454AAFACAA00614AA6BE73AC7CC29CBB"
+        "&dn=The.Odyssey.2026.1080p.TELESYNC.HEVC.AAC2.0-SPLiCE"
+        "&tr=http%3A%2F%2Ftracker.renfei.net%3A8080%2Fannounce"
+        "&tr=http%3A%2F%2Fp4p.arenabg.com%3A1337%2Fannounce"
+        "&tr=http%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce"
     ),
 }
 
@@ -1590,10 +1879,10 @@ class TorrentVideoSession:
         """
         Resolve a Magnet URI via:
         1. Explicit `x.pe` peers or registered local fixture seeder
-        2. Concurrent `tr=` HTTP & UDP (BEP 0015) tracker queries + public tracker fallback list
+        2. Concurrent `tr=` HTTP & UDP (BEP 0015) tracker queries + public tracker list
         3. Mainline DHT (BEP 0005 `get_peers`)
-        4. Parallel BEP 0009/0010 (`ut_metadata`) peer race across up to 35 peers concurrently
-        5. Automatic local BEP 0009/0003 Seeder provisioning for custom/fake/unseeded magnet links!
+        4. Parallel BEP 0009/0010 (`ut_metadata`) + BEP 0011 (`ut_pex`) peer race across up to 75 peers
+        5. Automatic local BEP 0009/0003 Seeder fallback ONLY if zero peers on the internet have metadata
         """
         m_info = parse_magnet_uri(magnet_uri)
         candidates = list(m_info.explicit_peers)
@@ -1604,15 +1893,14 @@ class TorrentVideoSession:
             if (seeder.host, seeder.port) not in candidates:
                 candidates.insert(0, (seeder.host, seeder.port))
 
-        trackers = list(m_info.trackers)
-        if not candidates:
-            for pub_tr in DEFAULT_PUBLIC_TRACKERS:
-                if pub_tr not in trackers:
-                    trackers.append(pub_tr)
+        trackers = list(DEFAULT_PUBLIC_TRACKERS)
+        for mtr in m_info.trackers:
+            if mtr not in trackers:
+                trackers.append(mtr)
 
         if trackers and not (m_info.info_hash.hex() in _GLOBAL_FIXTURE_SEEDERS):
             tracker_peers = discover_peers_from_trackers(
-                trackers, m_info.info_hash, self.peer_id, timeout=1.6
+                trackers, m_info.info_hash, self.peer_id, timeout=1.8
             )
             for tp in tracker_peers:
                 if tp not in candidates:
@@ -1624,27 +1912,39 @@ class TorrentVideoSession:
                 if dp not in candidates:
                     candidates.append(dp)
 
-        # Parallel BEP 0009/0010 ut_metadata race across up to 30 peers using daemon threads
+        # Parallel BEP 0009/0010 ut_metadata + BEP 0011 ut_pex race across up to 75 peers
         if candidates:
             found_info: List[Tuple[Dict[bytes, Any], Tuple[str, int]]] = []
+            pex_discovered: List[Tuple[str, int]] = []
+            unchoked_peers: List[Tuple[str, int]] = []
             found_event = threading.Event()
-            rem_peers = [min(30, len(candidates))]
+            probe_batch = candidates[:75]
+            rem_peers = [len(probe_batch)]
             p_lock = threading.Lock()
 
             def _probe_peer(p_addr: Tuple[str, int]) -> None:
+                local_pex: List[Tuple[str, int]] = []
+                local_unchoked: List[Tuple[str, int]] = []
                 try:
                     info_d = fetch_magnet_metadata_from_peer(
                         p_addr,
                         m_info.info_hash,
                         self.peer_id,
-                        timeout=2.2,
-                        require_unchoke=(not bool(self.web_seeds)),
+                        timeout=2.8,
+                        require_unchoke=False,
+                        pex_out=local_pex,
+                        unchoked_out=local_unchoked,
                     )
-                    if info_d is not None:
-                        with p_lock:
-                            if not found_info:
-                                found_info.append((info_d, p_addr))
-                                found_event.set()
+                    with p_lock:
+                        for up in local_unchoked:
+                            if up not in unchoked_peers:
+                                unchoked_peers.append(up)
+                        for xp in local_pex:
+                            if xp not in pex_discovered:
+                                pex_discovered.append(xp)
+                        if info_d is not None and not found_info:
+                            found_info.append((info_d, p_addr))
+                            found_event.set()
                 except Exception:
                     pass
                 finally:
@@ -1653,10 +1953,17 @@ class TorrentVideoSession:
                         if rem_peers[0] <= 0:
                             found_event.set()
 
-            for peer_addr in candidates[:30]:
+            for peer_addr in probe_batch:
                 threading.Thread(target=_probe_peer, args=(peer_addr,), daemon=True).start()
 
-            found_event.wait(timeout=2.4)
+            found_event.wait(timeout=3.0)
+            # If we got metadata quickly from an external swarm, give concurrent probes up to 0.45s
+            # to finish collecting MSG_UNCHOKE seeders and BEP 0011 ut_pex peer lists.
+            if found_info and not self.web_seeds and found_info[0][1][0] != "127.0.0.1":
+                wait_deadline = time.monotonic() + 0.45
+                while time.monotonic() < wait_deadline and len(unchoked_peers) < 3:
+                    time.sleep(0.05)
+
             if found_info:
                 info_dict, winning_peer = found_info[0]
                 meta = TorrentMetadata.from_info_dict(
@@ -1665,11 +1972,14 @@ class TorrentVideoSession:
                     announce_list=trackers,
                     override_info_hash=m_info.info_hash,
                 )
-                ordered = [winning_peer] + [p for p in candidates if p != winning_peer]
-                return meta, ordered
+                with p_lock:
+                    priority_peers: List[Tuple[str, int]] = []
+                    for p in unchoked_peers + pex_discovered + [winning_peer] + candidates:
+                        if p not in priority_peers:
+                            priority_peers.append(p)
+                return meta, priority_peers
 
-        # If no external peers responded on the internet (e.g. custom/fake parody magnet link
-        # or unseeded info_hash), auto-provision a local BEP 0009/0003 seeder for this magnet!
+        # Fallback ONLY when zero peers on the internet have metadata (e.g. synthetic/offline test hash)
         custom_seeder = provision_custom_magnet_seeder(m_info)
         seeder_addr = (custom_seeder.host, custom_seeder.port)
         info_dict = fetch_magnet_metadata_from_peer(
@@ -1685,6 +1995,23 @@ class TorrentVideoSession:
             return meta, [seeder_addr]
 
         raise RuntimeError(f"Could not resolve magnet metadata for {m_info.info_hash.hex()}")
+
+    def _on_pex_peers(self, new_peers: List[Tuple[str, int]]) -> None:
+        if self.stop_event.is_set() or self.store.is_complete:
+            return
+        for p in new_peers:
+            if p not in self.explicit_peers and len(self.workers) < 85:
+                self.explicit_peers.append(p)
+                worker = PeerWorker(
+                    peer_addr=p,
+                    metadata=self.metadata,
+                    store=self.store,
+                    peer_id=self.peer_id,
+                    stop_event=self.stop_event,
+                    on_pex_peers=self._on_pex_peers,
+                )
+                worker.start()
+                self.workers.append(worker)
 
     def start_swarm(self) -> None:
         discovered = list(self.explicit_peers)
@@ -1726,14 +2053,15 @@ class TorrentVideoSession:
                 ws_worker.start()
                 self.workers.append(ws_worker)
 
-        # 2. Start up to 35 concurrent TCP Peer Workers (BEP 0003)
-        for peer_addr in discovered[:35]:
+        # 2. Start up to 50 concurrent TCP Peer Workers (BEP 0003 + BEP 0011 PEX)
+        for peer_addr in discovered[:50]:
             worker = PeerWorker(
                 peer_addr=peer_addr,
                 metadata=self.metadata,
                 store=self.store,
                 peer_id=self.peer_id,
                 stop_event=self.stop_event,
+                on_pex_peers=self._on_pex_peers,
             )
             worker.start()
             self.workers.append(worker)
@@ -2028,7 +2356,8 @@ WEB_UI_HTML = """<!DOCTYPE html>
         <button class="btn-download" onclick="startSession('download')">⬇ Download Video</button>
         <button class="btn-fixture" onclick="loadFixtureMagnet('fixture')">🧪 Local H.264 Fixture (1 MB)</button>
         <button class="btn-fixture" onclick="loadFixtureMagnet('sintel')">🎬 Sintel Online Magnet (129 MB)</button>
-        <button class="btn-fixture" onclick="loadFixtureMagnet('big_buck_bunny')">🐰 Big Buck Bunny Online Magnet (263 MB)</button>
+        <button class="btn-fixture" onclick="loadFixtureMagnet('big_buck_bunny')">🐰 Big Buck Bunny (263 MB)</button>
+        <button class="btn-fixture" onclick="loadFixtureMagnet('odyssey')">🏛️ The Odyssey 2026 (5.56 GiB MKV)</button>
         <a id="saveDiskLink" class="btn-link btn-fixture" style="display:none;" href="/download" download>💾 Save File to Browser</a>
       </div>
       <div id="statusBanner" class="status-banner"></div>
@@ -2181,11 +2510,13 @@ WEB_UI_HTML = """<!DOCTYPE html>
         const st = await res.json();
         if (!st.active) return;
 
-        const pct = Math.round((st.progress || 0) * 100);
+        const rawPct = (st.progress || 0) * 100;
+        const pctLabel = (rawPct > 0 && rawPct < 1) ? rawPct.toFixed(2) : Math.round(rawPct);
+        const dlBytesStr = st.bytes_downloaded ? ' • ' + formatBytes(st.bytes_downloaded) : '';
         const speedStr = st.speed_bps ? ' • ' + formatBytes(st.speed_bps) + '/s' : '';
         document.getElementById('statProgress').textContent =
-          pct + '% (' + st.completed_pieces + '/' + st.total_pieces + ')' + speedStr;
-        document.getElementById('progressBar').style.width = pct + '%';
+          pctLabel + '% (' + st.completed_pieces + '/' + st.total_pieces + ')' + dlBytesStr + speedStr;
+        document.getElementById('progressBar').style.width = Math.min(100, Math.max(rawPct, st.bytes_downloaded ? 1.5 : 0)) + '%';
 
         const grid = document.getElementById('pieceGrid');
         if (st.pieces) {
@@ -2457,7 +2788,9 @@ class VideoStreamServer:
                     self.send_response(200, "OK")
 
                 fname = Path(store.target_file.path).name
-                self.send_header("Content-Type", "video/mp4")
+                ext = Path(fname).suffix.lower()
+                mime = "video/webm" if ext in (".mkv", ".webm") else "video/mp4"
+                self.send_header("Content-Type", mime)
                 self.send_header("Accept-Ranges", "bytes")
                 self.send_header("Content-Length", str(content_length))
                 self.send_header("Connection", "close")
@@ -2471,8 +2804,8 @@ class VideoStreamServer:
 
                 cursor = start_byte
                 while cursor <= end_byte:
-                    to_read = min(outer.stream_chunk_size, (end_byte - cursor) + 1)
-                    chunk = store.read_video_bytes(cursor, to_read, timeout=30.0)
+                    to_read = min(65536, (end_byte - cursor) + 1)
+                    chunk = store.read_video_bytes(cursor, to_read, timeout=45.0)
                     if not chunk:
                         break
                     try:

@@ -550,13 +550,14 @@ class TorrentVideoToolTests(unittest.TestCase):
         finally:
             bbb_session.close()
 
-    def test_6_custom_parody_magnet_link_with_dead_trackers(self) -> None:
+    def test_6_odyssey_magnet_link_real_mkv_swarm_streaming(self) -> None:
         """
-        Verify custom/parody Magnet URI (`The.Odyssey.2026...`) containing dead legacy trackers
-        (`9.rarbg.to`, `tracker.coppersurfer.tk`, etc.) and an unseeded custom info_hash:
-        - Filters dead tracker domains without DNS/TimeoutError hangs.
-        - Automatically provisions a local BEP 0009/0003 seeder for the custom info_hash & display name.
-        - Streams HTTP 206 Range video and completes full download.
+        Verify `The.Odyssey.2026...` Magnet URI (`48AEB057454AAFACAA00614AA6BE73AC7CC29CBB`):
+        - Filters dead legacy trackers (`9.rarbg.to`, `tracker.coppersurfer.tk`, etc.) and queries
+          active trackers + BEP 0011 (`ut_pex`) prioritizing non-6881 seeder ports.
+        - Resolves the real 5.96 GB Matroska `.mkv` (`5,968,900,866` bytes, `8 MiB` pieces).
+        - Streams real `1a45dfa3` Matroska + `V_MPEGH/ISO/HEVC` bytes over HTTP 206 Partial Content
+          using sub-piece 16 KiB block streaming without waiting for an entire 8 MiB piece.
         """
         odyssey_magnet = (
             "magnet:?xt=urn:btih:48AEB057454AAFACAA00614AA6BE73AC7CC29CBB"
@@ -583,19 +584,21 @@ class TorrentVideoToolTests(unittest.TestCase):
         session = TorrentVideoSession(odyssey_magnet, self.work_dir / "odyssey_dl")
         try:
             self.assertEqual(session.metadata.info_hash.hex(), "48aeb057454aafacaa00614aa6be73ac7cc29cbb")
-            self.assertEqual(session.target_file.path, "The.Odyssey.2026.1080p.TELESYNC.HEVC.AAC2.0-SPLiCE.mp4")
+            self.assertTrue(session.target_file.path.endswith("The.Odyssey.2026.1080p.TELESYNC.HEVC.AAC2.0-SPLiCE.mkv"))
+            self.assertEqual(session.target_file.length, 5968900866)
 
             stream_url = session.start_http_stream()
             session.start_swarm()
 
             req = urllib.request.Request(stream_url, headers={"Range": "bytes=0-65535"})
-            with urllib.request.urlopen(req, timeout=8.0) as resp:
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
                 self.assertEqual(resp.status, 206)
                 chunk = resp.read()
                 self.assertEqual(len(chunk), 65536)
-                self.assertEqual(chunk[4:8], b"ftyp")
-
-            self.assertTrue(session.wait_until_complete(timeout=10.0))
+                # Verify real Matroska EBML header (1a 45 df a3) and HEVC track metadata
+                self.assertEqual(chunk[:4], b"\x1a\x45\xdf\xa3")
+                self.assertIn(b"matroska", chunk[:64])
+                self.assertIn(b"V_MPEGH/ISO/HEVC", chunk)
         finally:
             session.close()
 
