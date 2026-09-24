@@ -4458,7 +4458,21 @@ class VideoStreamServer:
                         break
                     cursor += len(chunk)
 
-        self._httpd = _ThreadingHTTPServer((self.host, self.port), Handler)
+        try:
+            self._httpd = _ThreadingHTTPServer((self.host, self.port), Handler)
+        except OSError:
+            if self.port > 0:
+                try:
+                    import subprocess as _sp
+                    pids = _sp.check_output(["lsof", "-t", "-i", f":{self.port}"], text=True).split()
+                    for pid_s in pids:
+                        pid_i = int(pid_s)
+                        if pid_i != os.getpid():
+                            os.kill(pid_i, 15)
+                    time.sleep(0.35)
+                except Exception:
+                    pass
+            self._httpd = _ThreadingHTTPServer((self.host, self.port), Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
         return self.stream_url
