@@ -6,3 +6,8 @@ downloads/
 path/
 *.payload
 .DS_Store
+
+# Runtime metadata & peer cache
+fixtures/.metadata_cache/
+__pycache__/
+*.pyc

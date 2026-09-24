@@ -159,9 +159,11 @@ class MagnetInfo:
 def parse_magnet_uri(uri: str) -> MagnetInfo:
     """
     Parse a `magnet:?xt=urn:btih:<hash>&dn=...&tr=...&ws=...&x.pe=host:port` link.
-    Supports both 40-char hex SHA-1 info hashes and 32-char Base32 info hashes.
+    Supports both 40-char hex SHA-1 info hashes, 32-char Base32 info hashes,
+    and HTML-escaped `&amp;` query separators copied from web pages.
     """
-    uri = uri.strip()
+    import html as _html
+    uri = _html.unescape(uri.strip())
     if not uri.startswith("magnet:?"):
         raise ValueError(f"Invalid magnet URI (must start with 'magnet:?'): {uri}")
 
@@ -370,6 +372,9 @@ class SparseVideoPieceStore:
         self._seek_epoch: int = 0
         self._active_stream_id: int = 0
         self._active_stream_offset: int = 0
+        self._detected_index_offset: int = 0
+        self._index_pieces: List[int] = []
+        self._waiting_reads: Dict[int, Tuple[int, int, float]] = {}
         self._priority_cursor: int = self.first_piece
         self._urgent_pieces: List[int] = []
         self.bytes_downloaded: int = 0
@@ -406,17 +411,32 @@ class SparseVideoPieceStore:
     def register_stream_request(self, start_byte: int) -> int:
         """
         Register a new HTTP Range playback request. If it is a main playback/seek request
-        (not a tiny tail metadata probe), supersede older stream requests so stale sockets
-        immediately exit without overwriting `_urgent_pieces`.
+        (not a container tail `moov`/`Cues` index probe), supersede older stream requests
+        so stale sockets immediately exit without overwriting `_urgent_pieces`.
         """
         with self._lock:
-            is_tail_probe = start_byte >= max(0, self.target_file.length - 1048576) and start_byte > 0
+            tail_threshold = max(0, self.target_file.length - 20 * 1024 * 1024)
+            if self._detected_index_offset > 0:
+                tail_threshold = min(tail_threshold, self._detected_index_offset)
+            is_tail_probe = (
+                start_byte > 0
+                and start_byte >= tail_threshold
+                and (start_byte >= int(self.target_file.length * 0.90) or start_byte == self._detected_index_offset)
+            )
             if not is_tail_probe:
                 self._active_stream_id += 1
                 self._active_stream_offset = start_byte
                 self._lock.notify_all()
                 return self._active_stream_id
-            return -1  # Tail Cues/moov probe runs alongside active stream without superseding it
+            # Container index probe (`moov` at EOF or `Cues` at EOF): pin in `_index_pieces` without killing stream
+            idx_p = self.piece_for_file_offset(start_byte)
+            idx_blk = (((self.target_file.offset + start_byte) % self.metadata.piece_length) // BLOCK_SIZE) * BLOCK_SIZE
+            self._urgent_block_offsets[idx_p] = idx_blk
+            for mp in range(idx_p, min(self.last_piece + 1, idx_p + 4)):
+                if mp not in self.completed_pieces and mp not in self._index_pieces:
+                    self._index_pieces.append(mp)
+            self._lock.notify_all()
+            return -1
 
     def is_stream_superseded(self, stream_id: int) -> bool:
         if stream_id <= 0:
@@ -595,6 +615,9 @@ class SparseVideoPieceStore:
         is_head = bool(self._urgent_pieces and piece_index == self._urgent_pieces[0])
         if is_head:
             urgent_begin = self._urgent_block_offsets.get(piece_index, 0)
+            for b in range(urgent_begin, min(plen, urgent_begin + 8 * BLOCK_SIZE), BLOCK_SIZE):
+                if not received or b not in received:
+                    return True
             for b in range(urgent_begin, min(plen, urgent_begin + 16 * BLOCK_SIZE), BLOCK_SIZE):
                 if not received or b not in received:
                     if b not in claimed or (now - claimed[b]) >= 1.1:
@@ -631,6 +654,8 @@ class SparseVideoPieceStore:
 
             while self._urgent_pieces and self._urgent_pieces[0] in self.completed_pieces:
                 self._urgent_pieces.pop(0)
+            while self._index_pieces and self._index_pieces[0] in self.completed_pieces:
+                self._index_pieces.pop(0)
 
             # Ensure _urgent_pieces always has lookahead pieces if any remain
             if len(self._urgent_pieces) < 4:
@@ -653,6 +678,13 @@ class SparseVideoPieceStore:
                     self.in_progress_pieces.add(p)
                     self.in_progress_since[p] = now
                     return p
+
+            # 2b. Pre-fetch detected container index pieces (`moov`/`Cues`) when urgent head is already claimed
+            for ip in self._index_pieces:
+                if eligible(ip, can_steal=False):
+                    self.in_progress_pieces.add(ip)
+                    self.in_progress_since.setdefault(ip, now)
+                    return ip
 
             # 3. Sequential pieces from priority cursor
             for p in range(self._priority_cursor, self.last_piece + 1):
@@ -688,8 +720,8 @@ class SparseVideoPieceStore:
            the video player sought) before wrapping around to block 0.
         2. Never assigns a block in `exclude_offsets` (blocks already in-flight on the calling
            peer's own TCP connection), preventing duplicate `MSG_REQUEST` protocol errors.
-        3. Races straggler blocks (>= 1.1s) in the critical 16-block (256 KiB) seek-head window
-           across other peers while allowing fast seeders to pipeline full 16-block batches.
+        3. Hedges the critical 8-block (128 KiB) seek-head window across active peers so a single
+           slow peer can never hold hostage the first 64 KiB of an HTTP Range seek.
         """
         with self._lock:
             if piece_index in self.completed_pieces:
@@ -699,6 +731,7 @@ class SparseVideoPieceStore:
             claimed = self._claimed_blocks.setdefault(piece_index, {})
             now = time.monotonic()
             out: List[Tuple[int, int]] = []
+            added_begins: Set[int] = set()
 
             is_head_urgent = bool(self._urgent_pieces and piece_index == self._urgent_pieces[0])
             urgent_begin = self._urgent_block_offsets.get(piece_index, 0)
@@ -713,39 +746,48 @@ class SparseVideoPieceStore:
                 + list(range(0, urgent_begin, BLOCK_SIZE))
             )
 
-            # Pass 0 (Seek-Head Priority & Hedging): Ensure the first 16 blocks (256 KiB) at
-            # urgent_begin are claimed AND stolen (after 1.1s by a DIFFERENT peer) BEFORE
-            # allocating blocks further down the 8 MiB piece.
+            # Pass 0 (Seek-Head Hedging): Ensure the first 8 blocks (128 KiB) at urgent_begin are
+            # requested by every active seeder that does not already have them in-flight (`exclude_offsets`),
+            # followed by 1.1s straggler stealing on blocks 8..16.
             if is_head_urgent:
-                critical_head = ordered_offsets[:16]
-                for begin in critical_head:
+                for begin in ordered_offsets[:8]:
                     if begin in received or (exclude_offsets and begin in exclude_offsets):
+                        continue
+                    claimed.setdefault(begin, now)
+                    out.append((begin, min(BLOCK_SIZE, plen - begin)))
+                    added_begins.add(begin)
+                    if len(out) >= effective_batch:
+                        return out
+                for begin in ordered_offsets[8:16]:
+                    if begin in received or begin in added_begins or (exclude_offsets and begin in exclude_offsets):
                         continue
                     if begin not in claimed or (now - claimed.get(begin, 0.0)) >= 1.1:
                         claimed[begin] = now
                         out.append((begin, min(BLOCK_SIZE, plen - begin)))
+                        added_begins.add(begin)
                         if len(out) >= effective_batch:
                             return out
 
             # Pass 1: unclaimed blocks starting at urgent_begin
             for begin in ordered_offsets:
-                if begin in received or begin in claimed or (exclude_offsets and begin in exclude_offsets):
+                if begin in received or begin in claimed or begin in added_begins or (exclude_offsets and begin in exclude_offsets):
                     continue
                 claimed[begin] = now
                 out.append((begin, min(BLOCK_SIZE, plen - begin)))
+                added_begins.add(begin)
                 if len(out) >= effective_batch:
                     return out
 
             # Pass 2: steal straggler blocks starting at urgent_begin (from other peers only)
             for begin in ordered_offsets:
-                if begin in received or (exclude_offsets and begin in exclude_offsets):
+                if begin in received or begin in added_begins or (exclude_offsets and begin in exclude_offsets):
                     continue
                 if (now - claimed.get(begin, 0.0)) >= steal_timeout:
                     claimed[begin] = now
                     out.append((begin, min(BLOCK_SIZE, plen - begin)))
+                    added_begins.add(begin)
                     if len(out) >= effective_batch:
                         return out
-
             return out
 
     def store_block(self, piece_index: int, begin: int, block: bytes) -> bool:
@@ -769,11 +811,78 @@ class SparseVideoPieceStore:
             if piece_index in self.completed_pieces:
                 return True
 
+            # Anti-poisoning guard for cooperative sub-piece streaming on real multi-megabyte pieces:
+            # Reject bots that flood an entire 16 KiB block with a single non-padding byte (e.g. 0x69 * 16384).
+            if plen >= 524288 and len(block) >= 4096 and block[0] not in (0, 255):
+                if block == bytes([block[0]]) * len(block):
+                    return False
+
             if overlap_start < overlap_end and self._fd >= 0:
                 slice_start = overlap_start - block_global_start
                 slice_end = overlap_end - block_global_start
                 file_write_offset = overlap_start - file_global_start
-                os.pwrite(self._fd, block[slice_start:slice_end], file_write_offset)
+                written_slice = block[slice_start:slice_end]
+                if (
+                    plen >= 524288
+                    and file_write_offset == 0
+                    and len(written_slice) >= 12
+                    and self.target_file.path.lower().endswith(".mp4")
+                ):
+                    if written_slice[4:8] not in (b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot"):
+                        return False
+                os.pwrite(self._fd, written_slice, file_write_offset)
+                # Auto-detect non-faststart MP4s (`ftyp` followed immediately by `mdat`, placing `moov` at EOF)
+                # and MKV `SeekHead` -> `Cues` offsets so HTML5 <video> loads the full seek index immediately!
+                if file_write_offset == 0 and len(written_slice) >= 48:
+                    try:
+                        if self.target_file.path.lower().endswith(".mp4"):
+                            ftyp_len = struct.unpack("!I", written_slice[0:4])[0]
+                            if 8 <= ftyp_len <= 32 and written_slice[4:8] == b"ftyp":
+                                b2_len = struct.unpack("!I", written_slice[ftyp_len:ftyp_len + 4])[0]
+                                b2_type = written_slice[ftyp_len + 4:ftyp_len + 8]
+                                if b2_type == b"mdat":
+                                    if b2_len == 1:
+                                        b2_len = struct.unpack("!Q", written_slice[ftyp_len + 8:ftyp_len + 16])[0]
+                                    moov_file_off = ftyp_len + b2_len
+                                    if 0 < moov_file_off < self.target_file.length:
+                                        self._detected_index_offset = moov_file_off
+                                        moov_global = self.target_file.offset + moov_file_off
+                                        moov_p = moov_global // self.metadata.piece_length
+                                        moov_blk = ((moov_global % self.metadata.piece_length) // BLOCK_SIZE) * BLOCK_SIZE
+                                        self._urgent_block_offsets[moov_p] = moov_blk
+                                        for mp in range(moov_p, self.last_piece + 1):
+                                            if mp not in self.completed_pieces and mp not in self._index_pieces:
+                                                self._index_pieces.append(mp)
+                        elif written_slice[:4] == b"\x1a\x45\xdf\xa3":
+                            seg_idx = written_slice.find(b"\x18\x53\x80\x67")
+                            if seg_idx != -1 and seg_idx + 12 <= len(written_slice):
+                                fb = written_slice[seg_idx + 4]
+                                vlen = 1
+                                mask = 0x80
+                                while vlen <= 8 and not (fb & mask):
+                                    vlen += 1
+                                    mask >>= 1
+                                seg_data_start = seg_idx + 4 + vlen
+                                cues_pat = b"\x53\xab\x84\x1c\x53\xbb\x6b"
+                                c_idx = written_slice.find(cues_pat, seg_data_start)
+                                if c_idx != -1:
+                                    p_idx = written_slice.find(b"\x53\xac", c_idx + 7, c_idx + 26)
+                                    if p_idx != -1 and p_idx + 3 <= len(written_slice):
+                                        plen_v = written_slice[p_idx + 2] & 0x7F
+                                        if 1 <= plen_v <= 8 and p_idx + 3 + plen_v <= len(written_slice):
+                                            cues_rel = int.from_bytes(written_slice[p_idx + 3:p_idx + 3 + plen_v], "big")
+                                            cues_off = seg_data_start + cues_rel
+                                            if 0 < cues_off < self.target_file.length:
+                                                self._detected_index_offset = cues_off
+                                                cues_global = self.target_file.offset + cues_off
+                                                cues_p = cues_global // self.metadata.piece_length
+                                                cues_blk = ((cues_global % self.metadata.piece_length) // BLOCK_SIZE) * BLOCK_SIZE
+                                                self._urgent_block_offsets[cues_p] = cues_blk
+                                                for mp in range(cues_p, self.last_piece + 1):
+                                                    if mp not in self.completed_pieces and mp not in self._index_pieces:
+                                                        self._index_pieces.append(mp)
+                    except Exception:
+                        pass
 
             pbuf = self._piece_buffers.get(piece_index)
             if pbuf is None:
@@ -922,16 +1031,25 @@ class SparseVideoPieceStore:
         start_piece = self.piece_for_file_offset(file_offset)
         end_piece = self.piece_for_file_offset(end_offset)
         needed = set(range(start_piece, end_piece + 1))
+        global_start = self.target_file.offset + file_offset
+        urgent_begin = ((global_start % self.metadata.piece_length) // BLOCK_SIZE) * BLOCK_SIZE
 
-        # Re-prioritize whenever blocks are not yet present on disk or when crossing a piece boundary
         with self._lock:
             has_now = (
                 needed.issubset(self.completed_pieces)
                 or self._has_byte_range_blocks_locked(file_offset, length)
             )
-        if not has_now or getattr(self, "_last_read_piece", -1) != start_piece:
-            self._last_read_piece = start_piece
-            self.prioritize_byte_range(file_offset, end_offset)
+            if stream_id == -1 and not has_now:
+                self._urgent_block_offsets[start_piece] = urgent_begin
+                for ip in range(start_piece, min(self.last_piece + 1, end_piece + 2)):
+                    if ip not in self.completed_pieces and ip not in self._index_pieces:
+                        self._index_pieces.insert(0, ip)
+                self._lock.notify_all()
+
+        if stream_id >= 0 and (not has_now or getattr(self, "_last_read_piece", -1) != start_piece):
+            if not self.is_stream_superseded(stream_id):
+                self._last_read_piece = start_piece
+                self.prioritize_byte_range(file_offset, end_offset)
 
         deadline = time.monotonic() + timeout
         with self._lock:
@@ -949,21 +1067,6 @@ class SparseVideoPieceStore:
                     )
                 self._lock.wait(timeout=min(0.10, remaining))
             data = os.pread(self._fd, length, file_offset)
-            # For Matroska (.mkv) files at offset 0: if the tail Cues keyframe index is not yet on disk,
-            # mask SeekID=Cues (1c53bb6b -> ec53bb6b) so the video player immediately decodes Cluster 0
-            # instead of blocking on a multi-GB EOF read before frame 1.
-            if (
-                file_offset == 0
-                and len(data) >= 512
-                and data[:4] == b"\x1a\x45\xdf\xa3"
-                and not self._has_tail_index_blocks_locked()
-            ):
-                cues_pattern = b"\x53\xab\x84\x1c\x53\xbb\x6b"
-                idx = data[:512].find(cues_pattern)
-                if idx != -1:
-                    patched = bytearray(data)
-                    patched[idx:idx + 7] = b"\x53\xab\x84\xec\x53\xbb\x6b"
-                    data = bytes(patched)
             return data
 
 
@@ -1111,6 +1214,8 @@ DEAD_TRACKER_DOMAINS = (
     "ip-51-68-199.eu",
 )
 
+LOW_PRIORITY_PEER_PORTS = (6881, 6882, 6889, 15000, 15001, 15002, 1)
+
 
 def _extract_compact_peers(blob: bytes) -> List[Tuple[str, int]]:
     out: List[Tuple[str, int]] = []
@@ -1144,7 +1249,6 @@ def discover_peers_from_trackers(
     for tr in trackers:
         if any(dead in tr.lower() for dead in DEAD_TRACKER_DOMAINS):
             continue
-        # Normalize UDP trackers missing `/announce` suffix
         if tr.startswith("udp://") and "/announce" not in tr:
             tr = tr.rstrip("/") + "/announce"
         if tr not in filtered:
@@ -1155,6 +1259,8 @@ def discover_peers_from_trackers(
 
     fast_keywords = (
         "127.0.0.1",
+        "sukebei.tracker.wf",
+        "tracker.wf",
         "renfei.net",
         "arenabg.com",
         "dler.org",
@@ -1196,7 +1302,7 @@ def discover_peers_from_trackers(
         finally:
             with lock:
                 remaining[0] -= 1
-                if remaining[0] <= 0 or len(discovered) >= 220:
+                if remaining[0] <= 0 or len(discovered) >= 130:
                     done_event.set()
 
     for tr in ordered_trackers:
@@ -1204,11 +1310,9 @@ def discover_peers_from_trackers(
 
     done_event.wait(timeout=timeout + 0.25)
     with lock:
-        # Prioritize non-6881 ephemeral/configured client ports (e.g. qBittorrent/BitTorrent seeders)
-        # ahead of generic :6881 DHT crawler/NAT placeholder entries.
         return sorted(
             discovered,
-            key=lambda hp: (0 if hp[0] == "127.0.0.1" else (1 if hp[1] not in (6881, 6882, 6889) else 2)),
+            key=lambda hp: (0 if hp[0] == "127.0.0.1" else (1 if hp[1] not in LOW_PRIORITY_PEER_PORTS else 2)),
         )
 
 
@@ -1554,7 +1658,13 @@ class PeerWorker(threading.Thread):
                         r_idx, r_begin = struct.unpack("!II", payload[:8])
                         block = payload[8:]
                         inflight_blocks.pop((r_idx, r_begin), None)
-                        self.store.store_block(r_idx, r_begin, block)
+                        if not self.store.store_block(r_idx, r_begin, block):
+                            self.store.unclaim_blocks(r_idx, [r_begin])
+                            self.verified_seeder = False
+                            if self.verified_seeders is not None:
+                                self.verified_seeders.discard(self.peer_addr)
+                            self._consecutive_failures += 5
+                            raise ConnectionError("Poisoned or corrupted block rejected")
                         blocks_transferred += 1
                         self._mark_verified_seeder()
                     elif msg_id == MSG_HAVE and len(payload) >= 4 and peer_pieces is not None:
@@ -2217,9 +2327,9 @@ class TorrentVideoSession:
                 candidates.insert(0, (seeder.host, seeder.port))
 
         trackers = list(DEFAULT_PUBLIC_TRACKERS)
-        for mtr in m_info.trackers:
-            if mtr not in trackers:
-                trackers.append(mtr)
+        for tr in m_info.trackers:
+            if tr not in trackers:
+                trackers.append(tr)
 
         cache_dir = Path(__file__).resolve().parent / "fixtures" / ".metadata_cache"
         cache_info_path = cache_dir / f"{hex_hash}.info"
@@ -2228,14 +2338,14 @@ class TorrentVideoSession:
         cached_peers: List[Tuple[str, int]] = []
         if cache_peers_path.exists():
             try:
-                for item in json.loads(cache_peers_path.read_text()):
-                    hp = (str(item[0]), int(item[1]))
-                    if hp not in cached_peers:
-                        cached_peers.append(hp)
-                        if hp not in self.verified_seeders:
-                            self.verified_seeders.append(hp)
-                        if hp not in candidates:
-                            candidates.append(hp)
+                age = time.time() - cache_peers_path.stat().st_mtime
+                if age < 1800:
+                    for item in json.loads(cache_peers_path.read_text())[:10]:
+                        hp = (str(item[0]), int(item[1]))
+                        if hp not in cached_peers:
+                            cached_peers.append(hp)
+                            if hp not in candidates:
+                                candidates.append(hp)
             except Exception:
                 pass
 
@@ -2256,7 +2366,7 @@ class TorrentVideoSession:
 
         if trackers and not (hex_hash in _GLOBAL_FIXTURE_SEEDERS):
             tracker_peers = discover_peers_from_trackers(
-                trackers, m_info.info_hash, self.peer_id, timeout=(1.4 if cached_meta else 2.2)
+                trackers, m_info.info_hash, self.peer_id, timeout=(1.6 if cached_meta else 2.2)
             )
             for tp in tracker_peers:
                 if tp not in candidates:
@@ -2268,11 +2378,6 @@ class TorrentVideoSession:
                 if dp not in candidates:
                     candidates.append(dp)
 
-        # If we already have SHA-1 verified metadata cached on disk, DO NOT open throwaway
-        # _probe_peer TCP sockets to seeders! Opening and immediately closing a probe socket burns
-        # the seeder's first-connection unchoke slot. Instead, return `cached_meta` immediately so
-        # `PeerWorker` opens the first and only persistent TCP connection to every seeder and receives
-        # both `MSG_UNCHOKE` and BEP 0011 `ut_pex` directly on the streaming socket!
         if cached_meta is not None:
             priority_peers: List[Tuple[str, int]] = []
             for p in cached_peers + candidates:
@@ -2286,13 +2391,11 @@ class TorrentVideoSession:
             pex_discovered: List[Tuple[str, int]] = []
             unchoked_peers: List[Tuple[str, int]] = []
             found_event = threading.Event()
-            probe_batch = candidates[:40]
+            probe_batch = candidates[:50]
             rem_peers = [len(probe_batch)]
             p_lock = threading.Lock()
 
             def _probe_peer(p_addr: Tuple[str, int]) -> None:
-                if found_event.is_set():
-                    return
                 local_pex: List[Tuple[str, int]] = []
                 local_unchoked: List[Tuple[str, int]] = []
                 ephemeral_peer_id = b"-qB4620-" + os.urandom(12)
@@ -2329,6 +2432,11 @@ class TorrentVideoSession:
                 threading.Thread(target=_probe_peer, args=(peer_addr,), daemon=True).start()
 
             found_event.wait(timeout=3.4)
+            if found_info and not self.web_seeds and found_info[0][1][0] != "127.0.0.1":
+                wait_deadline = time.monotonic() + 0.55
+                while time.monotonic() < wait_deadline and len(unchoked_peers) < 3:
+                    time.sleep(0.05)
+
             if found_info:
                 info_dict, winning_peer, raw_b = found_info[0]
                 meta = TorrentMetadata.from_info_dict(
@@ -2338,6 +2446,9 @@ class TorrentVideoSession:
                     override_info_hash=m_info.info_hash,
                 )
                 with p_lock:
+                    for up in unchoked_peers:
+                        if up not in self.verified_seeders:
+                            self.verified_seeders.append(up)
                     priority_peers = []
                     for p in unchoked_peers + cached_peers + pex_discovered + [winning_peer] + candidates:
                         if p not in priority_peers:
@@ -2347,7 +2458,7 @@ class TorrentVideoSession:
                         cache_dir.mkdir(parents=True, exist_ok=True)
                         cache_info_path.write_bytes(raw_b)
                         cache_peers_path.write_text(
-                            json.dumps((unchoked_peers + cached_peers + [winning_peer] + pex_discovered)[:45])
+                            json.dumps((unchoked_peers + cached_peers + pex_discovered + [winning_peer])[:20])
                         )
                     except Exception:
                         pass
@@ -2388,21 +2499,19 @@ class TorrentVideoSession:
             if slots <= 0:
                 return
 
-            # Prioritize verified seeders first, then non-6881 client ports, then remaining swarm peers
             verified_set = set(self.verified_seeders)
             untried = [
                 p for p in self.explicit_peers
-                if p not in active_addrs and (p in verified_set or p not in self._spawned_peers)
+                if p not in active_addrs and p not in self._spawned_peers
             ]
             if not untried and connected_count < 8 and self.explicit_peers:
-                # All swarm candidates were tried once and few connected; reset _spawned_peers to re-sweep
                 self._spawned_peers = set(active_addrs)
                 untried = [p for p in self.explicit_peers if p not in active_addrs]
 
             untried.sort(
                 key=lambda hp: (
                     0 if hp[0] == "127.0.0.1"
-                    else (1 if hp in verified_set else (2 if hp[1] not in (6881, 6882, 6889) else 3))
+                    else (1 if hp in verified_set else (2 if hp[1] not in LOW_PRIORITY_PEER_PORTS else 3))
                 )
             )
 
@@ -2426,8 +2535,7 @@ class TorrentVideoSession:
         with self._workers_lock:
             for p in new_peers:
                 if p not in self.explicit_peers:
-                    # Insert non-6881 PEX peers near the front so _replenish_workers picks them up immediately
-                    if p[1] not in (6881, 6882, 6889):
+                    if p[1] not in LOW_PRIORITY_PEER_PORTS:
                         insert_idx = min(len(self.explicit_peers), len(self.verified_seeders) + 5)
                         self.explicit_peers.insert(insert_idx, p)
                     else:
@@ -3811,17 +3919,22 @@ WEB_UI_HTML = """<!DOCTYPE html>
     async function seekToPiece(pieceIdx) {
       if (!currentTotalPieces) return;
       try {
-        fetch('/api/seek-piece', {
+        const targetRatio = Math.max(0, Math.min(0.995, pieceIdx / currentTotalPieces));
+        await fetch('/api/seek-piece', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ piece_index: pieceIdx })
         }).catch(() => {});
         const video = document.getElementById('videoPlayer');
-        if (video.duration && isFinite(video.duration)) {
-          video.currentTime = (pieceIdx / currentTotalPieces) * video.duration;
+        if (video.duration && isFinite(video.duration) && video.duration > 0) {
+          video.currentTime = targetRatio * video.duration;
           video.play().catch(() => {});
+          showStatus('Jumped to Piece #' + pieceIdx + ' (~' + formatBytes(pieceIdx * currentPieceLength) + ') — streaming from this point immediately.');
+        } else {
+          window._pendingPieceSeekRatio = targetRatio;
+          video.play().catch(() => {});
+          showStatus('Prioritized Piece #' + pieceIdx + ' (~' + formatBytes(pieceIdx * currentPieceLength) + ') — player will jump as soon as container index loads.');
         }
-        showStatus('Prioritized Piece #' + pieceIdx + ' (~' + formatBytes(pieceIdx * currentPieceLength) + ') for instant sub-piece streaming.');
       } catch (_) {}
     }
 
@@ -3983,8 +4096,60 @@ WEB_UI_HTML = """<!DOCTYPE html>
     window.addEventListener('DOMContentLoaded', async () => {
       const video = document.getElementById('videoPlayer');
       video.addEventListener('timeupdate', updateSubtitleOverlay);
-      video.addEventListener('seeking', updateSubtitleOverlay);
+      video.addEventListener('seeking', () => {
+        if (
+          window._lastExplicitSeekStamp &&
+          (performance.now() - window._lastExplicitSeekStamp) < 300 &&
+          typeof window._lastExplicitSeekTime === 'number' &&
+          Math.abs(video.currentTime - window._lastExplicitSeekTime) > 1.5
+        ) {
+          video.currentTime = window._lastExplicitSeekTime;
+        }
+        updateSubtitleOverlay();
+      });
       video.addEventListener('seeked', updateSubtitleOverlay);
+      video.addEventListener('loadedmetadata', () => {
+        if (window._pendingPieceSeekRatio !== null && window._pendingPieceSeekRatio !== undefined && video.duration > 0) {
+          const ratio = window._pendingPieceSeekRatio;
+          window._pendingPieceSeekRatio = null;
+          video.currentTime = ratio * video.duration;
+          video.play().catch(() => {});
+        }
+      });
+
+      // Always seek by exactly +10s on Right Arrow and -10s on Left Arrow (intercepts native browser % jumps)
+      const handleArrowSeek = (e) => {
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        const active = document.activeElement;
+        if (active && active !== video && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT' || active.isContentEditable)) {
+          return;
+        }
+        if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          if (e.type === 'keydown') {
+            const baseTime = (
+              window._lastExplicitSeekStamp &&
+              (performance.now() - window._lastExplicitSeekStamp) < 250 &&
+              typeof window._lastExplicitSeekTime === 'number'
+            ) ? window._lastExplicitSeekTime : (video.currentTime || 0);
+            const delta = (e.key === 'ArrowRight') ? 10 : -10;
+            const maxDur = (video.duration && isFinite(video.duration) && video.duration > 0) ? video.duration : Infinity;
+            const nextTime = Math.max(0, Math.min(maxDur, baseTime + delta));
+            window._lastExplicitSeekTime = nextTime;
+            window._lastExplicitSeekStamp = performance.now();
+            if (document.activeElement === video) {
+              try { video.blur(); } catch (_) {}
+            }
+            video.currentTime = nextTime;
+            showStatus((delta > 0 ? '⏩ Forward +10s → ' : '⏪ Rewind -10s → ') + formatTimestamp(nextTime));
+          }
+        }
+      };
+      window.addEventListener('keydown', handleArrowSeek, { capture: true });
+      window.addEventListener('keyup', handleArrowSeek, { capture: true });
+
       setInterval(updateSubtitleOverlay, 45);
 
       await loadFixtureMagnet();
@@ -4118,6 +4283,7 @@ class VideoStreamServer:
                     if store is not None:
                         p_idx = int(body.get("piece_index", 0))
                         byte_off = max(0, p_idx * store.metadata.piece_length - store.target_file.offset)
+                        store.register_stream_request(byte_off)
                         store.prioritize_byte_range(byte_off, byte_off + 65536)
                         self._send_json(200, {"ok": True, "piece_index": p_idx})
                         return
